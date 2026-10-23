@@ -1,0 +1,247 @@
+{
+  "main": {
+    "id": "d8c5344b03e3078c",
+    "type": "split",
+    "children": [
+      {
+        "id": "6c4738e2116677da",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "2766daa438576216",
+            "type": "leaf",
+            "state": {
+              "type": "empty",
+              "state": {},
+              "icon": "lucide-file",
+              "title": "New tab"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "7e1539034192fbc1",
+    "type": "split",
+    "children": [
+      {
+        "id": "ba0b66228011dc05",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "25ffa417c6e2d98b",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "36ec46d11cde243c",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "8fc6a22f9bb33146",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 320.1328125
+  },
+  "right": {
+    "id": "1ada2ecc9c7ce52b",
+    "type": "split",
+    "children": [
+      {
+        "id": "e59866ff0caa37b4",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "5742e644d301228f",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "day1/Class 2 - 기업 보안 인프라 아키텍트 업무 소개.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for Class 2 - 기업 보안 인프라 아키텍트 업무 소개"
+            }
+          },
+          {
+            "id": "650352bbe16b6371",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "project/Todo/Technical Enhancement/Rewinding/Divide steps.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "e79ef720a84239bf",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "dc8f20176e52311b",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "95a592d1d4b40fe7",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          },
+          {
+            "id": "50ff09248dcbee51",
+            "type": "leaf",
+            "state": {
+              "type": "file-properties",
+              "state": {
+                "file": "project/presentations/261010 1차 중간발표/compare AI vs parser/scenario 6 result.md"
+              },
+              "icon": "lucide-info",
+              "title": "File properties"
+            }
+          }
+        ],
+        "currentTab": 4
+      }
+    ],
+    "direction": "horizontal",
+    "width": 324.5
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "2766daa438576216",
+  "lastOpenFiles": [
+    "project/meetings/meeting 32 - 10.23 정기 회의/meeting 32 - 10.23 정기회의.md",
+    "project/Todo/Technical Enhancement/Provenance Graph/Combined 4 schemas - Gemini Argon.md",
+    "project/meetings/meeting 31 - 10.21 6th mentoring/회의록.md",
+    "project/Todo/Technical Enhancement/Provenance Graph/Drawing Determinsitic Edge 3 - Gemini Argon.md",
+    "project/Todo/Technical Enhancement/Provenance Graph/Drawing Deterministic Edges 1 - Gemini.md",
+    "project/Todo/Technical Enhancement/Provenance Graph/Drawing Deterministic Edges 2 - Gemini.md",
+    "project/meetings/meeting 32 - 10.23 정기 회의/흐름도2.png",
+    "project/meetings/meeting 32 - 10.23 정기 회의",
+    "project/Todo/Technical Enhancement/PL feedback.md",
+    "261022.ics",
+    "project/daily report/10.22 일일 보고.md",
+    "DF classes/day 29/Class 1 - (박문범 멘토님) AI를 활용한 대용량 데이터 분석 및 공격자 행위 추출(1).md",
+    "project/daily report/10.21 일일 보고.md",
+    "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario/setup Scenario - Gemini.md",
+    "project/meetings/meeting 31 - 10.21 6th mentoring/[AISI] 6차 멘토링 - 2026_10_21 20_16 KST - Notes by Gemini.txt",
+    "project/meetings/meeting 31 - 10.21 6th mentoring/[AISI] 6차 멘토링 - 2026_10_21 20_16 KST - Notes by Gemini(1).txt",
+    "project/meetings/meeting 31 - 10.21 6th mentoring/Pasted image (6).png",
+    "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario/OS artifact scenario - Gemini.md",
+    "project/Todo/Technical Enhancement/Provenance Graph/Vertices and Edges - Gemini.md",
+    "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario",
+    "project/presentations/261010 1차 중간발표/compare AI vs parser/scenarios.md",
+    "project/presentations/261010 1차 중간발표/compare AI vs parser/scenario 3 creation - Gemini.md",
+    "project/meetings/meeting 31 - 10.21 6th mentoring/10.21 멘토링 안건.pdf",
+    "project/Todo/Technical Enhancement/Provenance Graph",
+    "project/Todo/Technical Enhancement/technical edge/1 - Argon high.md",
+    "project/meetings/meeting 31 - 10.21 6th mentoring",
+    "project/meetings/meeting 30 - 10.14 5th mentoring/회의록.md",
+    "project/Todo/Technical Enhancement/Rewinding/Antigravity Rewind Method.md",
+    "project/Todo/Technical Enhancement/Rewinding/Divide steps.md",
+    "project/Todo/Technical Enhancement/Rewinding/invoke tool calls.md",
+    "project/Todo/Technical Enhancement/Rewinding/Measure Similarity/Measuring Similarity 1 - Gemini.md",
+    "project/daily report/10.20 일일 보고.md",
+    "project/Todo/Technical Enhancement/Rewinding/LLM and Agent distinction - Gemini.md",
+    "project/Todo/Technical Enhancement/Rewinding/Antigravity Rewind Method - Gemini.md",
+    "2026-10-20.md",
+    "project/Todo/Technical Enhancement/technical edge",
+    "project/meetings/meeting 30 - 10.14 5th mentoring/10.14 멘토링 안건.pdf",
+    "project/daily report/10.19 일일 보고.md",
+    "project/reports/Weekly report/Week 7/Pasted image (2).png",
+    "project/reports/Weekly report/Week 7/Pasted image.png",
+    "project/Todo/Technical Enhancement/Rewinding/images/kickstart_no_proxy.png",
+    "project/Todo/Technical Enhancement/Rewinding/images/Pasted image.png",
+    "project/Todo/Technical Enhancement/Rewinding/images/kickstart_prompt.png",
+    "project/Todo/Technical Enhancement/Rewinding/images/rewind_to_tool_result_and_continue.png",
+    "project/Todo/Technical Enhancement/Rewinding/rewind_to_tool_result_and_continue.png",
+    "project/Todo/Technical Enhancement/Rewinding/Pasted image.png"
+  ]
+}

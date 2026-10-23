@@ -1,0 +1,10 @@
+{
+  "baseFontSize": 26,
+  "enabledCssSnippets": [
+    "codeblock_nowrap"
+  ],
+  "theme": "obsidian",
+  "textFontFamily": "Ubuntu Mono",
+  "monospaceFontFamily": "Ubuntu Mono",
+  "interfaceFontFamily": "Ubuntu Mono"
+}
