@@ -11,10 +11,14 @@
             "id": "2766daa438576216",
             "type": "leaf",
             "state": {
-              "type": "empty",
-              "state": {},
+              "type": "markdown",
+              "state": {
+                "file": "Improvements/Improvements - Gemini.md",
+                "mode": "preview",
+                "source": true
+              },
               "icon": "lucide-file",
-              "title": "New tab"
+              "title": "Improvements - Gemini"
             }
           }
         ]
@@ -157,6 +161,7 @@
             "state": {
               "type": "outline",
               "state": {
+                "file": "Improvements/Improvements - Gemini.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
@@ -197,6 +202,16 @@
   },
   "active": "2766daa438576216",
   "lastOpenFiles": [
+    "__pycache__/Antigravity_Rewind.cpython-314.pyc",
+    "__pycache__",
+    "src/rewinding/__pycache__/tui.cpython-314.pyc",
+    "tests/__pycache__/test_tui.cpython-314-pytest-9.1.1.pyc",
+    "tests/test_tui.py",
+    "src/rewinding/tui.py",
+    "Untitled.md",
+    "Improvements",
+    "Improvements/Improvements - Gemini.md",
+    "Documents",
     "project/meetings/meeting 32 - 10.23 정기 회의/meeting 32 - 10.23 정기회의.md",
     "project/Todo/Technical Enhancement/Provenance Graph/Combined 4 schemas - Gemini Argon.md",
     "project/meetings/meeting 31 - 10.21 6th mentoring/회의록.md",
@@ -212,17 +227,12 @@
     "project/daily report/10.21 일일 보고.md",
     "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario/setup Scenario - Gemini.md",
     "project/meetings/meeting 31 - 10.21 6th mentoring/[AISI] 6차 멘토링 - 2026_10_21 20_16 KST - Notes by Gemini.txt",
-    "project/meetings/meeting 31 - 10.21 6th mentoring/[AISI] 6차 멘토링 - 2026_10_21 20_16 KST - Notes by Gemini(1).txt",
     "project/meetings/meeting 31 - 10.21 6th mentoring/Pasted image (6).png",
     "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario/OS artifact scenario - Gemini.md",
     "project/Todo/Technical Enhancement/Provenance Graph/Vertices and Edges - Gemini.md",
-    "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario",
     "project/presentations/261010 1차 중간발표/compare AI vs parser/scenarios.md",
     "project/presentations/261010 1차 중간발표/compare AI vs parser/scenario 3 creation - Gemini.md",
-    "project/meetings/meeting 31 - 10.21 6th mentoring/10.21 멘토링 안건.pdf",
-    "project/Todo/Technical Enhancement/Provenance Graph",
     "project/Todo/Technical Enhancement/technical edge/1 - Argon high.md",
-    "project/meetings/meeting 31 - 10.21 6th mentoring",
     "project/meetings/meeting 30 - 10.14 5th mentoring/회의록.md",
     "project/Todo/Technical Enhancement/Rewinding/Antigravity Rewind Method.md",
     "project/Todo/Technical Enhancement/Rewinding/Divide steps.md",
@@ -230,11 +240,6 @@
     "project/Todo/Technical Enhancement/Rewinding/Measure Similarity/Measuring Similarity 1 - Gemini.md",
     "project/daily report/10.20 일일 보고.md",
     "project/Todo/Technical Enhancement/Rewinding/LLM and Agent distinction - Gemini.md",
-    "project/Todo/Technical Enhancement/Rewinding/Antigravity Rewind Method - Gemini.md",
-    "2026-10-20.md",
-    "project/Todo/Technical Enhancement/technical edge",
-    "project/meetings/meeting 30 - 10.14 5th mentoring/10.14 멘토링 안건.pdf",
-    "project/daily report/10.19 일일 보고.md",
     "project/reports/Weekly report/Week 7/Pasted image (2).png",
     "project/reports/Weekly report/Week 7/Pasted image.png",
     "project/Todo/Technical Enhancement/Rewinding/images/kickstart_no_proxy.png",

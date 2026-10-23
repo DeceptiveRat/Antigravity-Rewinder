@@ -27,9 +27,27 @@ STEP_TYPE_USER_INPUT = 14
 STEP_TYPE_MODEL_RESPONSE = 15
 
 # Path resolution relative to repository structure
+REAL_FILE = os.path.realpath(__file__)
+REAL_DIR = os.path.dirname(REAL_FILE)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-candidate_src = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+
+# Ensure src/ is in sys.path whether executed directly or via symlink
+candidate_src = os.path.abspath(os.path.join(REAL_DIR, ".."))
+if os.path.isdir(candidate_src) and candidate_src not in sys.path:
+    sys.path.insert(0, candidate_src)
+local_src = os.path.abspath(os.path.join(SCRIPT_DIR, "src"))
+if os.path.isdir(local_src) and local_src not in sys.path:
+    sys.path.insert(0, local_src)
+
+# Ensure the module can be resolved under both 'rewinding.Antigravity_Rewind' and 'Antigravity_Rewind'
+if __name__ in sys.modules:
+    sys.modules.setdefault("rewinding.Antigravity_Rewind", sys.modules[__name__])
+    sys.modules.setdefault("Antigravity_Rewind", sys.modules[__name__])
+
 if os.path.isfile(os.path.join(candidate_src, "cli.py")):
+    SRC_DIR = candidate_src
+    REPO_ROOT = os.path.abspath(os.path.join(SRC_DIR, ".."))
+elif os.path.isdir(candidate_src) and os.path.basename(candidate_src) == "src":
     SRC_DIR = candidate_src
     REPO_ROOT = os.path.abspath(os.path.join(SRC_DIR, ".."))
 else:
@@ -4773,6 +4791,11 @@ def main():
         action="store_true",
         help="Rewind to immediately before the target model response or tool call step, preserving prior context and arming the session for model regeneration."
     )
+    parser.add_argument(
+        "--tui", "-i", "--interactive",
+        action="store_true",
+        help="Launch the interactive terminal UI (TUI visual scrubber) for step-by-step navigation and rewinding."
+    )
     # Kickstart cleanup arguments
     parser.add_argument(
         "--cleanup", "--clean-kickstart",
@@ -4790,6 +4813,14 @@ def main():
 
     base_dir = resolve_base_dir(args.dir)
     conv_id = get_conversation_id(base_dir, args.conv)
+
+    if getattr(args, "tui", False):
+        try:
+            from rewinding.tui import launch_tui
+        except ModuleNotFoundError:
+            from tui import launch_tui
+        launch_tui(base_dir, conv_id, dry_run=args.dry_run)
+        return
 
     if args.show_step is not None:
         show_step(base_dir, conv_id, args.show_step)

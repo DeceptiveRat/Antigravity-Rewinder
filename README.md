@@ -38,7 +38,22 @@ pip install pytest
 
 ## Basic Usage
 
-### 1. Inspect a Specific Step
+### 1. Interactive Terminal Scrubber (TUI)
+Launch the keyboard-driven visual timeline scrubber:
+```bash
+python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> --tui
+# or with short flag
+python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> -i
+```
+- Up/Down or j/k: Scrub between historical steps
+- PageUp/PageDown: Scroll right-hand inspector view
+- B: Rewind before response (triggers model regeneration from prior context)
+- R: Rewind to selected step (truncates downstream turns)
+- I: Intervene on tool call (interactive modal prompt for substring replacement)
+- D: Toggle dry-run simulation mode
+- Q: Quit
+
+### 2. Inspect a Specific Step
 ```bash
 python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> --show-step 3
 ```
