@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 detect_step_info = rewind_mod.detect_step_info
 execute_rewind = rewind_mod.execute_rewind
 execute_tool_intervene = rewind_mod.execute_tool_intervene
+execute_fork = getattr(rewind_mod, "execute_fork", None)
 clean_preview = rewind_mod.clean_preview
 STEP_TYPE_USER_INPUT = rewind_mod.STEP_TYPE_USER_INPUT
 STEP_TYPE_MODEL_RESPONSE = rewind_mod.STEP_TYPE_MODEL_RESPONSE
@@ -339,6 +340,39 @@ class RewindTUIApp:
             self.status_msg = msg
             return False, msg
 
+    def execute_action_fork(self, branch_name: str = "branch", arm_running: bool = False) -> tuple[bool, str, str | None]:
+        """Performs non-destructive fork action at the currently selected step."""
+        step = self.get_selected_step()
+        if not step:
+            return False, "No step selected.", None
+
+        if execute_fork is None:
+            return False, "execute_fork function is not available.", None
+
+        category = step.category
+        if arm_running:
+            if category.startswith("tool_call_") or category == "model_response":
+                category = "model_response"
+
+        try:
+            fork_cid = execute_fork(
+                base_dir=self.base_dir,
+                parent_conv_id=self.conv_id,
+                target_step=step.idx,
+                branch_name=branch_name,
+                dry_run=self.dry_run,
+                arm_running=arm_running,
+                category=category
+            )
+            mode_tag = " [DRY-RUN]" if self.dry_run else ""
+            msg = f"Forked to branch '{branch_name}' ({fork_cid[:8]}...){mode_tag}."
+            self.status_msg = msg
+            return True, msg, fork_cid
+        except Exception as exc:
+            msg = f"Fork failed: {exc}"
+            self.status_msg = msg
+            return False, msg, None
+
     def format_inspector_lines(self, step: StepItem) -> list[tuple[str, int]]:
         """
         Formats inspector lines as (text, color_pair_id) tuples for rendering.
@@ -508,6 +542,8 @@ class RewindTUIApp:
             self._prompt_and_rewind(arm_running=True)
         elif ch in (ord('i'), ord('I')):
             self._prompt_and_intervene()
+        elif ch in (ord('f'), ord('F')):
+            self._prompt_and_fork(arm_running=False)
 
     def _render_timeline(self, stdscr, start_y: int, start_x: int, height: int, width: int):
         """Renders vertical scrubber timeline on left panel."""
@@ -591,7 +627,7 @@ class RewindTUIApp:
         """Renders status and keybinding hints bar."""
         import curses
 
-        hints = "[↑/↓] Scrub | [B] Before-Resp | [R] Rewind | [I] Intervene | [D] Dry-Run | [Q] Quit"
+        hints = "[↑/↓] Scrub | [B] Before-Resp | [R] Rewind | [I] Intervene | [F] Fork | [D] Dry-Run | [Q] Quit"
         stdscr.attron(curses.A_BOLD)
         try:
             stdscr.addstr(start_y, start_x, hints[:width - 1])
@@ -624,6 +660,27 @@ class RewindTUIApp:
         confirmed = self._show_confirm_dialog(prompt)
         if confirmed:
             self.execute_action_rewind(arm_running=arm_running)
+
+    def _prompt_and_fork(self, arm_running: bool = False):
+        """Input dialog and confirmation before executing conversation fork."""
+        step = self.get_selected_step()
+        if not step:
+            return
+
+        branch_name = self._show_input_dialog(f"Fork @ Step {step.idx} - Branch Name (default: 'branch'):")
+        if branch_name is None:
+            return
+        branch_name = branch_name.strip() or "branch"
+
+        success, msg, new_cid = self.execute_action_fork(branch_name=branch_name, arm_running=arm_running)
+        if success and not self.dry_run and new_cid:
+            switch_now = self._show_confirm_dialog(f"Forked to {new_cid[:8]}... Switch TUI to new branch? [y/N]:")
+            if switch_now:
+                self.conv_id = new_cid
+                self.loader = SessionDataLoader(self.base_dir, self.conv_id)
+                self.loader.reload()
+                self.cursor = max(0, min(self.cursor, len(self.loader.steps) - 1))
+                self.status_msg = f"Switched TUI to branch '{branch_name}' ({new_cid[:8]})."
 
     def _prompt_and_intervene(self):
         """Modal dialog prompting for replacement strings."""

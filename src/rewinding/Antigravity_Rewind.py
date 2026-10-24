@@ -2090,8 +2090,9 @@ def detect_step_info(base_dir: str, conv_id: str, step_idx: int) -> tuple[str, s
     return ("unknown", str(step_type))
 
 
-def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool = False, source_base_dir: str = None, arm_running: bool = False):
+def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool = False, source_base_dir: str = None, arm_running: bool = False, source_conv_id: str = None):
     """Rewinds conversation state: truncates DB, transcripts, chunks, and history."""
+    src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
     proto_cache_path = os.path.join(base_dir, "jetbox_summaries_proto.pb")
@@ -2107,7 +2108,7 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
 
     read_db_path = conv_db_path
     if dry_run and source_base_dir:
-        read_db_path = os.path.join(source_base_dir, "conversations", f"{conv_id}.db")
+        read_db_path = os.path.join(source_base_dir, "conversations", f"{src_cid}.db")
 
     conn = sqlite3.connect(read_db_path)
     cur = conn.cursor()
@@ -2178,12 +2179,12 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
 
     # File paths to inspect for dry_run
     src_dir = source_base_dir if (dry_run and source_base_dir) else base_dir
-    inspect_tf_path = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
-    inspect_tc_path = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "transcript.jsonl")
-    inspect_chunks_full = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "chunks", "transcript_full")
-    inspect_chunks_comp = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "chunks", "transcript")
+    inspect_tf_path = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
+    inspect_tc_path = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "transcript.jsonl")
+    inspect_chunks_full = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "chunks", "transcript_full")
+    inspect_chunks_comp = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "chunks", "transcript")
     inspect_history_path = os.path.join(src_dir, "history.jsonl")
-    inspect_steps_dir = os.path.join(src_dir, "brain", conv_id, ".system_generated", "steps")
+    inspect_steps_dir = os.path.join(src_dir, "brain", src_cid, ".system_generated", "steps")
 
     if dry_run:
         tf_del = count_or_truncate_jsonl(inspect_tf_path, target_step, dry_run=True)
@@ -2193,7 +2194,10 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
         hist_del = count_or_filter_history(inspect_history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=True)
         st_del, _, _ = sync_or_prune_step_dirs(inspect_steps_dir, target_step, dry_run=True)
 
-        print(f"[DRY-RUN] Conversation ID: {conv_id}")
+        if source_conv_id:
+            print(f"[DRY-RUN] Target Conversation ID: {conv_id} (Forked from {source_conv_id})")
+        else:
+            print(f"[DRY-RUN] Conversation ID: {conv_id}")
         target_desc = f"delete steps >= {target_step} (before Model Response)" if arm_running else f"delete steps >= {target_step}"
         print(f"[DRY-RUN] Rewind target: {target_desc}")
         print(f"[DRY-RUN] Steps remaining: {remaining_steps}")
@@ -2325,7 +2329,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                            replace_web_content: str = None,
                            choice: str = None,
                            write_in: str = None,
-                           dry_run: bool = False, source_base_dir: str = None):
+                           dry_run: bool = False, source_base_dir: str = None,
+                           source_conv_id: str = None):
     """
     Executes Intervene Mode on a tool call at target_step:
       - Category A: Read tools (view_file, etc.)
@@ -2338,6 +2343,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     and arms conversation state.
     """
     result_step = target_step + 1
+    src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
     proto_cache_path = os.path.join(base_dir, "jetbox_summaries_proto.pb")
@@ -2353,7 +2359,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     read_db_path = conv_db_path
     if dry_run and source_base_dir:
-        read_db_path = os.path.join(source_base_dir, "conversations", f"{conv_id}.db")
+        read_db_path = os.path.join(source_base_dir, "conversations", f"{src_cid}.db")
 
     conn = sqlite3.connect(read_db_path)
     cur = conn.cursor()
@@ -2657,12 +2663,12 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # Dry run paths
     src_dir = source_base_dir if (dry_run and source_base_dir) else base_dir
-    inspect_tf_path = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
-    inspect_tc_path = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "transcript.jsonl")
-    inspect_chunks_full = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "chunks", "transcript_full")
-    inspect_chunks_comp = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "chunks", "transcript")
+    inspect_tf_path = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
+    inspect_tc_path = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "transcript.jsonl")
+    inspect_chunks_full = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "chunks", "transcript_full")
+    inspect_chunks_comp = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "chunks", "transcript")
     inspect_history_path = os.path.join(src_dir, "history.jsonl")
-    inspect_steps_dir = os.path.join(src_dir, "brain", conv_id, ".system_generated", "steps")
+    inspect_steps_dir = os.path.join(src_dir, "brain", src_cid, ".system_generated", "steps")
 
     if dry_run:
         tf_del = modify_or_truncate_jsonl(inspect_tf_path, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
@@ -2681,7 +2687,10 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             dry_run=True
         )
 
-        print(f"[DRY-RUN] Conversation ID: {conv_id}")
+        if source_conv_id:
+            print(f"[DRY-RUN] Target Conversation ID: {conv_id} (Forked from {source_conv_id})")
+        else:
+            print(f"[DRY-RUN] Conversation ID: {conv_id}")
         print(f"[DRY-RUN] Intervene Mode: Tool Call Step {target_step} ({tool_name}) -> Tool Result Step {result_step}")
         if simulate_error is not None:
             if tool_name in COMMAND_TOOLS:
@@ -3120,7 +3129,8 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
                                replace_text: str = None, replace_file: str = None,
                                subagent_exit: str = "crash",
                                subagent_error_msg: str = None,
-                               dry_run: bool = False, source_base_dir: str = None):
+                               dry_run: bool = False, source_base_dir: str = None,
+                               source_conv_id: str = None):
     """
     Executes Category F Intervene Mode on a subagent report (step_type = 101) at target_step.
     Applies text substitutions or replacement, attaches exit trailers (crash/complete),
@@ -3128,6 +3138,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     marks subagent status in .system_generated/subagents/<child_uuid>.json and conversation_summaries.db,
     truncates downstream steps, and arms conversation state for resumption.
     """
+    src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
     proto_cache_path = os.path.join(base_dir, "jetbox_summaries_proto.pb")
@@ -3144,7 +3155,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
 
     read_db_path = conv_db_path
     if dry_run and source_base_dir:
-        read_db_path = os.path.join(source_base_dir, "conversations", f"{conv_id}.db")
+        read_db_path = os.path.join(source_base_dir, "conversations", f"{src_cid}.db")
 
     conn = sqlite3.connect(read_db_path)
     cur = conn.cursor()
@@ -3365,10 +3376,10 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # Dry-run paths
     src_dir = source_base_dir if (dry_run and source_base_dir) else base_dir
-    inspect_tf_path = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
-    inspect_tc_path = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "transcript.jsonl")
-    inspect_chunks_full = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "chunks", "transcript_full")
-    inspect_chunks_comp = os.path.join(src_dir, "brain", conv_id, ".system_generated", "logs", "chunks", "transcript")
+    inspect_tf_path = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
+    inspect_tc_path = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "transcript.jsonl")
+    inspect_chunks_full = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "chunks", "transcript_full")
+    inspect_chunks_comp = os.path.join(src_dir, "brain", src_cid, ".system_generated", "logs", "chunks", "transcript")
     inspect_history_path = os.path.join(src_dir, "history.jsonl")
 
     if dry_run:
@@ -3378,7 +3389,10 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
         cc_del_lines, cc_del_files = modify_or_truncate_chunks(inspect_chunks_comp, target_step, modify_step=target_step, old_str=original_report, new_str=final_report, dry_run=True)
         hist_del = count_or_filter_history(inspect_history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=True)
 
-        print(f"[DRY-RUN] Conversation ID: {conv_id}")
+        if source_conv_id:
+            print(f"[DRY-RUN] Target Conversation ID: {conv_id} (Forked from {source_conv_id})")
+        else:
+            print(f"[DRY-RUN] Conversation ID: {conv_id}")
         print(f"[DRY-RUN] Intervene Mode: Subagent Report Step {target_step} (Sender: {sender_uuid or 'unknown'}, Exit Mode: {subagent_exit})")
         if trailer:
             print(f"[DRY-RUN] Trailer appended: '{clean_preview(trailer, 70)}'")
@@ -3762,12 +3776,14 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                            replace_file: str = None,
                            dry_run: bool = False,
                            source_base_dir: str = None,
-                           keep_task_log: bool = False):
+                           keep_task_log: bool = False,
+                           source_conv_id: str = None):
     """
     Executes Category G Intervene Mode on a background task tool call (manage_task, schedule)
     or an asynchronous background task notification (SYSTEM_MESSAGE, step_type = 101).
     Synchronizes SQLite steps, transcripts, chunk logs, message files, and tasks/task-*.log.
     """
+    src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
     proto_cache_path = os.path.join(base_dir, "jetbox_summaries_proto.pb")
@@ -3784,7 +3800,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
     read_db_path = conv_db_path
     if dry_run and source_base_dir:
-        read_db_path = os.path.join(source_base_dir, "conversations", f"{conv_id}.db")
+        read_db_path = os.path.join(source_base_dir, "conversations", f"{src_cid}.db")
 
     conn = sqlite3.connect(read_db_path)
     cur = conn.cursor()
@@ -3971,7 +3987,10 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
         if dry_run:
             conn.close()
-            print(f"[DRY-RUN] Conversation ID: {conv_id}")
+            if source_conv_id:
+                print(f"[DRY-RUN] Target Conversation ID: {conv_id} (Forked from {source_conv_id})")
+            else:
+                print(f"[DRY-RUN] Conversation ID: {conv_id}")
             print(f"[DRY-RUN] Intervene Mode: Background Task Tool Call Step {target_step} ({tool_name}) -> Tool Result Step {result_step}")
             if task_status:
                 print(f"[DRY-RUN] Task status: {task_status}")
@@ -4292,7 +4311,10 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
         if dry_run:
             conn.close()
-            print(f"[DRY-RUN] Conversation ID: {conv_id}")
+            if source_conv_id:
+                print(f"[DRY-RUN] Target Conversation ID: {conv_id} (Forked from {source_conv_id})")
+            else:
+                print(f"[DRY-RUN] Conversation ID: {conv_id}")
             print(f"[DRY-RUN] Intervene Mode: Background Task Notification Step {target_step} ({sender})")
             if task_status:
                 print(f"[DRY-RUN] Task status: {task_status}")
@@ -4651,6 +4673,315 @@ def execute_kickstart_cleanup(
     print(f"  - Purged summary protobuf cache and presence locks.")
 
 
+def setup_fork_destination(
+    base_dir: str,
+    parent_conv_id: str,
+    fork_conv_id: str,
+    branch_name: str,
+    target_step: int,
+    dry_run: bool = False,
+    intervention_type: str = "",
+    details: str = ""
+) -> None:
+    """Prepares the forked conversation SQLite database and brain directory, and records branch lineage."""
+    conv_dir = os.path.join(base_dir, "conversations")
+    parent_db = os.path.join(conv_dir, f"{parent_conv_id}.db")
+    fork_db = os.path.join(conv_dir, f"{fork_conv_id}.db")
+    parent_brain = os.path.join(base_dir, "brain", parent_conv_id)
+    fork_brain = os.path.join(base_dir, "brain", fork_conv_id)
+    summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
+
+    if not os.path.exists(parent_db):
+        raise FileNotFoundError(f"Source conversation database not found at {parent_db}")
+
+    if dry_run:
+        print(f"[DRY-RUN] Fork source: {parent_conv_id}")
+        print(f"[DRY-RUN] Fork destination: {fork_conv_id} (branch: '{branch_name}')")
+        print(f"[DRY-RUN] Would copy DB: {parent_db} -> {fork_db}")
+        if os.path.exists(parent_brain):
+            print(f"[DRY-RUN] Would copy brain directory: {parent_brain} -> {fork_brain}")
+        print(f"[DRY-RUN] Would register in conversation_summaries.db and conversation_lineage table")
+        return
+
+    # 1. Copy conversation database
+    os.makedirs(conv_dir, exist_ok=True)
+    shutil.copyfile(parent_db, fork_db)
+
+    # 2. Copy brain directory if present
+    if os.path.exists(parent_brain):
+        os.makedirs(os.path.dirname(fork_brain), exist_ok=True)
+        shutil.copytree(parent_brain, fork_brain, symlinks=False, dirs_exist_ok=True)
+
+    # 3. Register fork in conversation_summaries.db and conversation_lineage
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if os.path.exists(summary_db_path):
+        with sqlite3.connect(summary_db_path) as s_conn:
+            s_conn.row_factory = sqlite3.Row
+            s_cur = s_conn.cursor()
+
+            # Ensure lineage table exists
+            s_cur.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_lineage (
+                    fork_id TEXT PRIMARY KEY,
+                    parent_id TEXT NOT NULL,
+                    fork_step INTEGER NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    intervention_type TEXT DEFAULT '',
+                    details TEXT DEFAULT ''
+                )
+            """)
+
+            # Check existing columns in conversation_summaries
+            table_cols = [r[1] for r in s_cur.execute("PRAGMA table_info(conversation_summaries)").fetchall()]
+            parent_row = s_cur.execute(
+                "SELECT * FROM conversation_summaries WHERE conversation_id = ?",
+                (parent_conv_id,)
+            ).fetchone()
+
+            if parent_row:
+                row_dict = dict(parent_row)
+                row_dict["conversation_id"] = fork_conv_id
+                if "parent_conversation_id" in table_cols:
+                    row_dict["parent_conversation_id"] = parent_conv_id
+                if "title" in table_cols:
+                    orig_title = row_dict.get("title", "") or ""
+                    row_dict["title"] = f"[{branch_name}] {orig_title}".strip()
+                if "last_modified_time" in table_cols:
+                    row_dict["last_modified_time"] = now_iso
+                if "nesting_depth" in table_cols:
+                    row_dict["nesting_depth"] = (row_dict.get("nesting_depth") or 0) + 1
+
+                insert_cols = [c for c in table_cols if c in row_dict]
+                col_names = ", ".join(insert_cols)
+                placeholders = ", ".join(["?" for _ in insert_cols])
+                values = [row_dict[c] for c in insert_cols]
+                s_cur.execute(
+                    f"INSERT OR REPLACE INTO conversation_summaries ({col_names}) VALUES ({placeholders})",
+                    values
+                )
+            else:
+                # Fallback insertion if parent summary row was missing
+                s_cur.execute("""
+                    INSERT OR REPLACE INTO conversation_summaries (
+                        conversation_id, title, preview, step_count, last_modified_time,
+                        workspace_uris, status, parent_conversation_id, last_user_input_time
+                    ) VALUES (?, ?, '', 0, ?, '', '', ?, ?)
+                """, (fork_conv_id, f"[{branch_name}] Fork @ Step {target_step}", now_iso, parent_conv_id, now_iso))
+
+            # Record lineage
+            s_cur.execute("""
+                INSERT OR REPLACE INTO conversation_lineage (
+                    fork_id, parent_id, fork_step, branch_name, created_at, intervention_type, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (fork_conv_id, parent_conv_id, target_step, branch_name, now_iso, intervention_type, details))
+            s_conn.commit()
+
+
+def execute_fork(
+    base_dir: str,
+    parent_conv_id: str,
+    target_step: int,
+    branch_name: str = "branch",
+    dry_run: bool = False,
+    arm_running: bool = False,
+    category: str = "prompt",
+    intervention_kwargs: dict = None,
+    fork_conv_id: str = None
+) -> str:
+    """
+    Creates a non-destructive conversation fork/branch at target_step.
+    Parent conversation state remains completely untouched.
+    Returns the newly created fork conversation ID.
+    """
+    fork_cid = fork_conv_id or str(uuid.uuid4())
+    kwargs = dict(intervention_kwargs or {})
+
+    # Detect intervention type label for lineage record
+    it_type = ""
+    if category.startswith("tool_call_"):
+        if kwargs.get("simulate_error") is not None:
+            it_type = f"simulate_error={kwargs.get('simulate_error')}"
+        elif kwargs.get("replace_old") or kwargs.get("replace_text") or kwargs.get("replace_file"):
+            it_type = "tool_content_replacement"
+        elif kwargs.get("choice") or kwargs.get("write_in"):
+            it_type = "inquiry_selection"
+        elif kwargs.get("replace_web_content"):
+            it_type = "web_content_replacement"
+    elif category == "subagent_report":
+        it_type = f"subagent_exit={kwargs.get('subagent_exit', 'crash')}"
+    elif category in ("tool_call_task", "task_notification"):
+        it_type = f"task_status={kwargs.get('task_status', 'override')}"
+    elif arm_running or category == "model_response":
+        it_type = "before_response_regeneration"
+
+    setup_fork_destination(
+        base_dir=base_dir,
+        parent_conv_id=parent_conv_id,
+        fork_conv_id=fork_cid,
+        branch_name=branch_name,
+        target_step=target_step,
+        dry_run=dry_run,
+        intervention_type=it_type
+    )
+
+    src_bdir = base_dir if dry_run else None
+
+    if category in ("prompt", "model_response"):
+        execute_rewind(
+            base_dir,
+            fork_cid,
+            target_step,
+            dry_run=dry_run,
+            source_base_dir=src_bdir,
+            arm_running=arm_running,
+            source_conv_id=(parent_conv_id if dry_run else None)
+        )
+    elif category in ("tool_call_read", "tool_call_command", "tool_call_write", "tool_call_web", "tool_call_inquiry"):
+        execute_tool_intervene(
+            base_dir,
+            fork_cid,
+            target_step,
+            dry_run=dry_run,
+            source_base_dir=src_bdir,
+            source_conv_id=(parent_conv_id if dry_run else None),
+            **kwargs
+        )
+    elif category == "subagent_report":
+        execute_subagent_intervene(
+            base_dir,
+            fork_cid,
+            target_step,
+            dry_run=dry_run,
+            source_base_dir=src_bdir,
+            source_conv_id=(parent_conv_id if dry_run else None),
+            **kwargs
+        )
+    elif category in ("tool_call_task", "task_notification"):
+        execute_task_intervene(
+            base_dir,
+            fork_cid,
+            target_step,
+            dry_run=dry_run,
+            source_base_dir=src_bdir,
+            source_conv_id=(parent_conv_id if dry_run else None),
+            **kwargs
+        )
+
+    return fork_cid
+
+
+def render_lineage_tree(base_dir: str) -> None:
+    """Renders an ASCII tree representing the conversation multiverse DAG."""
+    summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
+    if not os.path.exists(summary_db_path):
+        print("No conversation_summaries.db found. No conversations to display.")
+        return
+
+    with sqlite3.connect(summary_db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "conversation_summaries" not in tables:
+            print("No conversation_summaries table found.")
+            return
+
+        summaries = {
+            r["conversation_id"]: dict(r)
+            for r in cur.execute("SELECT * FROM conversation_summaries").fetchall()
+        }
+
+        lineage_map = {}
+        if "conversation_lineage" in tables:
+            for r in cur.execute("SELECT * FROM conversation_lineage").fetchall():
+                lineage_map[r["fork_id"]] = dict(r)
+
+    children = {}
+    roots = []
+    all_conv_ids = set(summaries.keys())
+
+    for cid, row in summaries.items():
+        parent_id = row.get("parent_conversation_id") or ""
+        if not parent_id and cid in lineage_map:
+            parent_id = lineage_map[cid].get("parent_id", "")
+
+        if parent_id and parent_id in all_conv_ids:
+            children.setdefault(parent_id, []).append(cid)
+        else:
+            roots.append(cid)
+
+    roots.sort(key=lambda c: summaries[c].get("last_modified_time", ""))
+
+    print("\n================================================================================")
+    print("                    CONVERSATION MULTIVERSE TREE (DAG)                         ")
+    print("================================================================================\n")
+
+    def print_node(cid: str, prefix: str = "", is_last: bool = True, is_root: bool = False):
+        info = summaries.get(cid, {})
+        title = info.get("title") or info.get("preview") or "(untitled)"
+        step_count = info.get("step_count", 0)
+        lineage = lineage_map.get(cid)
+
+        branch_tag = f" [{lineage['branch_name']}]" if lineage and lineage.get("branch_name") else ""
+        fork_step_tag = f" [Fork @ Step {lineage['fork_step']}]" if lineage and "fork_step" in lineage else ""
+        intervene_tag = f" ({lineage['intervention_type']})" if lineage and lineage.get("intervention_type") else ""
+
+        if is_root:
+            connector = "* "
+            child_prefix = "  "
+            print(f"{connector}{cid} (Root, {step_count} steps){branch_tag}: \"{title}\"")
+        else:
+            connector = "└── " if is_last else "├── "
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            print(f"{prefix}{connector}{fork_step_tag} {cid} ({step_count} steps){branch_tag}{intervene_tag}: \"{title}\"")
+
+        node_children = children.get(cid, [])
+        for i, child_id in enumerate(node_children):
+            print_node(child_id, child_prefix, is_last=(i == len(node_children) - 1), is_root=False)
+
+    for i, root_id in enumerate(roots):
+        print_node(root_id, "", is_last=(i == len(roots) - 1), is_root=True)
+        if i < len(roots) - 1:
+            print()
+
+    fork_count = sum(len(c) for c in children.values())
+    print("\n--------------------------------------------------------------------------------")
+    print(f"Total Conversations: {len(all_conv_ids)} ({len(roots)} Root(s), {fork_count} Fork(s))")
+    print("================================================================================\n")
+
+
+def list_conversation_branches(base_dir: str) -> None:
+    """Lists all forked branches and their parent lineage in tabular format."""
+    summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
+    if not os.path.exists(summary_db_path):
+        print("No conversation_summaries.db found.")
+        return
+
+    with sqlite3.connect(summary_db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "conversation_lineage" not in tables:
+            print("No conversation_lineage table found. No forked branches have been created yet.")
+            return
+
+        rows = cur.execute("SELECT * FROM conversation_lineage ORDER BY created_at DESC").fetchall()
+        if not rows:
+            print("No forked branches found.")
+            return
+
+        print(f"\n{'Branch Name':<22} {'Fork Step':<11} {'Fork ID':<38} {'Parent ID':<38} {'Intervention'}")
+        print("-" * 125)
+        for r in rows:
+            bname = r["branch_name"] or "branch"
+            step_str = f"Step {r['fork_step']}"
+            fid = r["fork_id"]
+            pid = r["parent_id"]
+            itype = r["intervention_type"] or "-"
+            print(f"{bname:<22} {step_str:<11} {fid:<38} {pid:<38} {itype}")
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Search conversation steps or rewind Antigravity conversation state."
@@ -4796,6 +5127,24 @@ def main():
         action="store_true",
         help="Launch the interactive terminal UI (TUI visual scrubber) for step-by-step navigation and rewinding."
     )
+    # Fork / Multiverse Branching arguments
+    parser.add_argument(
+        "--fork", "-b", "--branch",
+        nargs="?",
+        const="branch",
+        default=None,
+        help="Create a non-destructive conversation fork/branch at the target step instead of modifying the parent conversation in place. Optional value specifies branch name/label (default: 'branch')."
+    )
+    parser.add_argument(
+        "--tree", "-t", "--lineage",
+        action="store_true",
+        help="Display the conversation multiverse tree (DAG showing parent conversations and their forked branches)."
+    )
+    parser.add_argument(
+        "--list-branches", "--branches",
+        action="store_true",
+        help="List all forked conversation branches and their parent lineage."
+    )
     # Kickstart cleanup arguments
     parser.add_argument(
         "--cleanup", "--clean-kickstart",
@@ -4812,6 +5161,15 @@ def main():
     args = parser.parse_args()
 
     base_dir = resolve_base_dir(args.dir)
+
+    if getattr(args, "tree", False):
+        render_lineage_tree(base_dir)
+        return
+
+    if getattr(args, "list_branches", False):
+        list_conversation_branches(base_dir)
+        return
+
     conv_id = get_conversation_id(base_dir, args.conv)
 
     if getattr(args, "tui", False):
@@ -5072,6 +5430,82 @@ def main():
                         file=sys.stderr
                     )
                     sys.exit(1)
+
+            if getattr(args, "fork", None) is not None:
+                branch_name = args.fork or f"branch-step-{target_step}"
+                intervention_kwargs = {}
+                if category in ("tool_call_read", "tool_call_command", "tool_call_write", "tool_call_web", "tool_call_inquiry"):
+                    tool_desc = detail or ("ask_question" if category == "tool_call_inquiry" else ("web_tool" if category == "tool_call_web" else ("write_tool" if category == "tool_call_write" else ("run_command" if category == "tool_call_command" else "read_tool"))))
+                    intervention_kwargs = {
+                        "tool_name": tool_desc,
+                        "replace_old": args.replace_old,
+                        "replace_new": args.replace_new,
+                        "replace_text": args.replace_text,
+                        "replace_file": args.replace_file,
+                        "simulate_error": args.simulate_error,
+                        "error_output": getattr(args, "error_output", None),
+                        "replace_web_content": args.replace_web_content,
+                        "choice": args.choice,
+                        "write_in": args.write_in,
+                    }
+                elif category == "subagent_report":
+                    intervention_kwargs = {
+                        "sender_uuid": detail,
+                        "child_step": getattr(args, "child_step", None),
+                        "replace_old": args.replace_old,
+                        "replace_new": args.replace_new,
+                        "replace_text": args.replace_text,
+                        "replace_file": args.replace_file,
+                        "subagent_exit": args.subagent_exit or "crash",
+                        "subagent_error_msg": args.subagent_error_msg,
+                    }
+                elif category in ("tool_call_task", "task_notification"):
+                    intervention_kwargs = {
+                        "category": category,
+                        "detail": detail,
+                        "task_status": args.task_status,
+                        "task_exit_code": args.task_exit_code,
+                        "task_output": args.task_output,
+                        "replace_old": args.replace_old,
+                        "replace_new": args.replace_new,
+                        "replace_text": args.replace_text,
+                        "replace_file": args.replace_file,
+                        "keep_task_log": getattr(args, "keep_task_log", False),
+                    }
+
+                fork_cid = execute_fork(
+                    base_dir=base_dir,
+                    parent_conv_id=conv_id,
+                    target_step=target_step,
+                    branch_name=branch_name,
+                    dry_run=args.dry_run,
+                    arm_running=(category == "model_response"),
+                    category=category,
+                    intervention_kwargs=intervention_kwargs
+                )
+
+                if args.dry_run:
+                    print_standout_box([
+                        "[DRY-RUN] Fork preview complete.",
+                        f"Branch Name : {branch_name}",
+                        f"Fork ID     : {fork_cid}",
+                        f"Parent ID   : {conv_id}",
+                        f"Fork Step   : {target_step}",
+                        "Parent conversation would remain completely unmodified."
+                    ], border_char="*")
+                else:
+                    print_standout_box([
+                        "Fork created successfully!",
+                        f"Branch Name : {branch_name}",
+                        f"Fork ID     : {fork_cid}",
+                        f"Parent ID   : {conv_id}",
+                        f"Fork Step   : {target_step}",
+                        "",
+                        "Parent conversation remains untouched.",
+                        "To interact with this branch in Antigravity:",
+                        f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {fork_cid}'
+                    ], border_char="*")
+                return
 
             if raw_dest != raw_source:
                 if args.dry_run:
