@@ -1269,3 +1269,63 @@ def test_fork_with_an_output_folder_is_refused(base_dir, tmp_path, monkeypatch, 
     assert capsys.readouterr().err == error_box("--fork and --out-dir cannot be used together. A fork is always created beside the original.")
     assert snapshot(base_dir) == before
     assert not destination.exists()
+# ---------------------------------------------------------------------------
+# A subagent is only cut at a step that is known to be its own
+# ---------------------------------------------------------------------------
+
+def report_without_child_step(text: str = "Worker finished the analysis") -> bytes:
+    return system_message_payload(MESSAGE_ID, CHILD, text)
+
+
+def add_child_steps(base: Path, count: int) -> None:
+    with open_db(base / "conversations" / f"{CHILD}.db") as conn:
+        for idx in range(6, count):
+            conn.execute("INSERT INTO steps VALUES (?, 15, 3, ?)", (idx, b"child step"))
+
+
+@pytest.mark.parametrize("exit_mode", ["crash", "complete", "keep-alive"])
+def test_report_with_no_known_child_step_is_refused(base_dir, monkeypatch, capsys, exit_mode):
+    """The parent's step number was used instead, which is meaningless to the child: 40 steps became 16."""
+    set_step_payload(base_dir, CONV, REPORT_STEP, report_without_child_step())
+    add_child_steps(base_dir, 40)
+    before = snapshot(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", exit_mode, "--replace-text", "NEW REPORT")
+
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == error_box(
+        f"Could not tell which step of subagent {CHILD} sent the report at step {REPORT_STEP}. Use --child-step to name it."
+    )
+    assert snapshot(base_dir) == before
+
+
+def test_child_step_option_names_the_cut(base_dir, monkeypatch):
+    set_step_payload(base_dir, CONV, REPORT_STEP, report_without_child_step())
+    add_child_steps(base_dir, 40)
+
+    run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "crash", "--child-step", "30")
+
+    assert sorted(child_steps(base_dir)) == list(range(31))
+
+
+def test_report_can_change_when_the_child_has_no_database(base_dir, monkeypatch):
+    """With no child to cut, there is no wrong place to cut it."""
+    set_step_payload(base_dir, CONV, REPORT_STEP, report_without_child_step())
+    (base_dir / "conversations" / f"{CHILD}.db").unlink()
+
+    run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "keep-alive", "--replace-text", "NEW REPORT")
+
+    assert extract_subagent_msg_info(stored_payload(base_dir, REPORT_STEP))[2] == "NEW REPORT"
+
+
+def test_child_step_from_the_message_file_is_still_used(base_dir, monkeypatch):
+    set_step_payload(base_dir, CONV, REPORT_STEP, report_without_child_step())
+    add_child_steps(base_dir, 40)
+    path = write_message_file(base_dir, MESSAGE_ID, CHILD)
+    path.write_text(json.dumps({"id": MESSAGE_ID, "sender": CHILD, "recipient": CONV, "content": "text",
+                                "sourceMetadata": {"tool": {"stepIndex": 25}}}), encoding="utf-8")
+
+    run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "crash")
+
+    assert sorted(child_steps(base_dir)) == list(range(26))

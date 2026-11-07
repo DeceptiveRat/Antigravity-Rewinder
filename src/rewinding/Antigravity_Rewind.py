@@ -3527,15 +3527,13 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
         child_db = os.path.join(base_dir, "conversations", f"{sender_uuid}.db")
         if not os.path.exists(child_db) and source_base_dir:
             child_db = os.path.join(source_base_dir, "conversations", f"{sender_uuid}.db")
+        # The parent's step number means nothing to the child, so cutting there would remove the wrong steps
         if os.path.exists(child_db):
-            try:
-                cconn = sqlite3.connect(child_db)
-                max_s = cconn.execute("SELECT MAX(idx) FROM steps WHERE idx <= ?", (target_step,)).fetchone()
-                if max_s and max_s[0] is not None:
-                    child_step_index = max_s[0]
-                cconn.close()
-            except Exception:
-                pass
+            conn.close()
+            raise ValueError(
+                f"Could not tell which step of subagent {sender_uuid} sent the report at step {target_step}. "
+                "Use --child-step to name it."
+            )
 
     # Extract original subagent report content
     original_report = proto_content
