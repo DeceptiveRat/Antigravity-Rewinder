@@ -1519,6 +1519,13 @@ def update_transcript_content(content: str, old_str: str, new_str: str, whole_re
     parts = split_numbered_text(content)
     if parts:
         return join_numbered_text(parts[0], parts[1], new_str, parts[3])
+    if BACKGROUND_LAUNCH.match(content):
+        # A launch has no completion time yet, and is now shown as a finished result
+        m_created = re.search(r"Created At: ([^\n]+)", content)
+        created_str = m_created.group(1) if m_created else datetime.now(timezone.utc).isoformat()
+        m_comp = re.search(r"Completed At: ([^\n]+)", content)
+        comp_str = m_comp.group(1) if m_comp else created_str
+        return f"Created At: {created_str}\nCompleted At: {comp_str}\n\n{new_str.strip()}\n"
     if old_str and old_str in content:
         return content.replace(old_str, new_str)
     if old_str and old_str.strip() in content:
@@ -2562,14 +2569,16 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
     print(f"  {resume_command(base_dir, conv_id)}")
 
 
-def is_background_launch(payload: bytes | None) -> bool:
-    """Tells a command result that started a background task apart from output that merely mentions one."""
-    if not payload:
-        return False
-    if b"background task" in payload:
-        return True
+# How the result of a real background launch starts. Output that merely mentions a task does not start this way.
+BACKGROUND_LAUNCH = re.compile(
+    r"(?:Created At: [^\n]*\n)?(?:Completed At: [^\n]*\n)?\n*Tool is running as a background task with task id: \S*?(task-\d+)"
+)
+
+
+def has_background_record(payload: bytes | None) -> bool:
+    """Tells whether a result holds Field 148, the record of a background task. Many real launches have none."""
     try:
-        return any(fn == 148 for fn, _, _ in parse_fields(payload))
+        return any(fn == 148 for fn, _, _ in parse_fields(payload or b""))
     except ValueError:
         return False
 
@@ -2604,22 +2613,15 @@ def find_last_result_step(cur: sqlite3.Cursor, transcript_path: str, call_step: 
 
 def find_launched_task(transcript_path: str, result_step: int, payload: bytes | None) -> str | None:
     """Returns the background task a command result started, or None if the result started none."""
-    if not is_background_launch(payload):
+    content = extract_content_from_transcript(transcript_path, result_step) or ""
+    match = BACKGROUND_LAUNCH.match(content)
+    if match:
+        return match.group(1)
+    if not has_background_record(payload):
         return None
-    if os.path.exists(transcript_path):
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if record.get("step_index") == result_step:
-                    match = re.search(r"task-(\d+)", record.get("content", ""))
-                    if match:
-                        return f"task-{match.group(1)}"
-                    break
+    match = re.search(r"task-(\d+)", content)
+    if match:
+        return f"task-{match.group(1)}"
     match = re.search(rb"task-(\d+)", payload)
     return f"task-{match.group(1).decode('utf-8')}" if match else None
 

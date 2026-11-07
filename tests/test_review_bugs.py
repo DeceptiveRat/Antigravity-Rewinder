@@ -30,6 +30,7 @@ from test_forks import (
     run_cli,
     snapshot,
     system_message_payload,
+    task_logs,
 )
 
 SYSTEM_STEP = 18
@@ -795,3 +796,56 @@ def test_dry_run_counts_only_the_files_it_would_change(base_dir, monkeypatch, ca
 
     assert "Step artifact files to update" not in capsys.readouterr().out
     assert snapshot(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# A background launch is recognised by how its result starts, not by mentions of one
+# ---------------------------------------------------------------------------
+
+LOGS_ALL = {"task-2": "TASK 2 FINAL OUTPUT\n", "task-4": "TASK 4 FINAL OUTPUT\n"}
+LOGS_WITHOUT_TASK_2 = {"task-4": "TASK 4 FINAL OUTPUT\n"}
+LAUNCH_LINE = f"Tool is running as a background task with task id: {CONV}/task-2\nTask Description: pytest"
+CREATED_ONLY = "Created At: 2026-10-19T05:10:00Z\n"
+MARKER_148 = bytes_field(148, bytes_field(1, f"{CONV}/task-2".encode()) + bytes_field(4, b"pytest"))
+
+
+@pytest.mark.parametrize("shown", [
+    pytest.param(TIMESTAMPS + "Notes: read about a background task in task-2", id="mention"),
+    pytest.param(TIMESTAMPS + "Command exited with code 0.\n\nCommand output:\nThe word task-2 and background task\n", id="in-output"),
+    pytest.param(TIMESTAMPS + f"Command exited with code 0.\n\nCommand output:\n{LAUNCH_LINE}\n", id="launch-text-in-output"),
+    pytest.param(TIMESTAMPS + f"grep found: {LAUNCH_LINE}", id="launch-text-mid-line"),
+])
+def test_output_mentioning_a_background_task_keeps_its_log(base_dir, monkeypatch, shown):
+    """A phrase anywhere in the result counted as a launch, which deleted the log, even with --keep-task-log."""
+    add_task_logs(base_dir)
+    store_result(base_dir, 4, shape_plain(shown), shown)
+
+    run_cli(monkeypatch, base_dir, "3", "--simulate-error", "1", "--keep-task-log")
+
+    assert task_logs(base_dir, CONV) == LOGS_ALL
+
+
+@pytest.mark.parametrize("payload, shown", [
+    pytest.param(shape_plain("started"), CREATED_ONLY + LAUNCH_LINE, id="real-without-marker"),
+    pytest.param(result_step(bytes_field(1, b"started"), MARKER_148), CREATED_ONLY + LAUNCH_LINE, id="real-with-marker"),
+    pytest.param(result_step(bytes_field(1, b"started"), MARKER_148), "started task-2", id="marker-and-text-mismatch"),
+])
+def test_simulated_error_on_a_real_launch_removes_its_log(base_dir, monkeypatch, payload, shown):
+    """97 of 128 real launches have no marker and no phrase in the database, so they went unnoticed."""
+    add_task_logs(base_dir)
+    store_result(base_dir, 4, payload, shown)
+
+    run_cli(monkeypatch, base_dir, "3", "--simulate-error", "1", "--keep-task-log")
+
+    assert task_logs(base_dir, CONV) == LOGS_WITHOUT_TASK_2
+
+
+def test_simulated_error_on_a_launch_is_shown_as_a_finished_result(base_dir, monkeypatch):
+    add_task_logs(base_dir)
+    store_result(base_dir, 4, shape_plain("started"), CREATED_ONLY + LAUNCH_LINE)
+
+    run_cli(monkeypatch, base_dir, "3", "--simulate-error", "1", "--keep-task-log")
+
+    created = "2026-10-19T05:10:00Z"
+    finished = f"Created At: {created}\nCompleted At: {created}\n\nThe command exited with code 1.\n"
+    assert shown_texts(base_dir, 4) == [finished] * 4
