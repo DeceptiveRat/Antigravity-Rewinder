@@ -4703,6 +4703,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                         "content": new_content
                     }, f, indent=2)
                 msg_updated = True
+                matched_msg_file = msg_path
             except Exception:
                 pass
 

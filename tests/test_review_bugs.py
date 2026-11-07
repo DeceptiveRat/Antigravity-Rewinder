@@ -1436,3 +1436,18 @@ def test_damaged_read_record_is_left_alone(base_dir, monkeypatch, damage):
     run_cli(monkeypatch, base_dir, "19")
 
     assert record.read_text(encoding="utf-8") == damage
+
+
+# ---------------------------------------------------------------------------
+# A task message's file survives when it had to be written anew
+# ---------------------------------------------------------------------------
+
+def test_message_file_written_for_an_edited_notification_is_kept(base_dir, monkeypatch):
+    """A file written moments earlier looked recent to the cleanup that follows, so it was deleted at once."""
+    messages = base_dir / "brain" / CONV / ".system_generated" / "messages"
+    messages.mkdir()
+
+    run_cli(monkeypatch, base_dir, "17", "--replace-text", "NEW MESSAGE")
+
+    [written] = list(messages.glob("*.json"))
+    assert json.loads(written.read_text(encoding="utf-8"))["content"] == "NEW MESSAGE"
