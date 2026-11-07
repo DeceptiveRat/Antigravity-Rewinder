@@ -35,6 +35,7 @@ STEP_TYPE_MODEL_RESPONSE = rewind_mod.STEP_TYPE_MODEL_RESPONSE
 # The fork and intervene keys ask for replacement text on these steps
 REPLACEABLE_CATEGORIES = rewind_mod.TOOL_INTERVENTION_CATEGORIES + rewind_mod.TASK_INTERVENTION_CATEGORIES
 # A fork has its own copy of a subagent, so unlike the intervene key it can also change a subagent's report
+TEXT_BOX_REFUSAL = "Cancelled: the text box only accepts plain ASCII. Use the command line."
 FORK_TEXT_CATEGORIES = REPLACEABLE_CATEGORIES + ("subagent_report",)
 FORKABLE_CATEGORIES = ("prompt", "model_response") + FORK_TEXT_CATEGORIES
 
@@ -956,6 +957,7 @@ class RewindTUIApp:
         curses.curs_set(1)
 
         input_str = ""
+        rejected = False
         while True:
             win.erase()
             win.box()
@@ -963,11 +965,17 @@ class RewindTUIApp:
             # Display current input
             display_str = input_str[-(box_w - 6):]
             win.addstr(2, 2, "> " + display_str)
+            if rejected:
+                win.addstr(3, 2, TEXT_BOX_REFUSAL[:box_w - 4])
             win.refresh()
 
             ch = win.getch()
             if ch in (10, 13, curses.KEY_ENTER):  # Enter
                 curses.curs_set(0)
+                if rejected:
+                    # Text that could not be typed must not count as blank, which means "replace everything"
+                    self.status_msg = TEXT_BOX_REFUSAL
+                    return None
                 return input_str
             if ch == 27:  # ESC
                 curses.curs_set(0)
@@ -976,6 +984,8 @@ class RewindTUIApp:
                 input_str = input_str[:-1]
             elif 32 <= ch <= 126:
                 input_str += chr(ch)
+            elif 128 <= ch <= 255:
+                rejected = True
 
 
 def launch_tui(base_dir: str, conv_id: str, dry_run: bool = False):

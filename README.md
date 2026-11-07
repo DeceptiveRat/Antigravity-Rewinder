@@ -61,7 +61,7 @@ python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> 
 
 If a background task's log holds output from steps being discarded, R, B, I, and F ask whether to clear those logs. Answering no cancels the action. For other log content, use `--task-output` on the command line.
 
-The text box accepts one line of plain ASCII. For multi-line or non-ASCII text, use `--replace-text` or `--replace-file` on the command line.
+The text box accepts one line of plain ASCII, and typing anything else cancels the action. For multi-line or non-ASCII text, use `--replace-text` or `--replace-file` on the command line.
 
 ### Inspect a Specific Step
 ```bash

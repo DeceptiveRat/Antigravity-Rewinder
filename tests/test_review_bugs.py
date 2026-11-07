@@ -21,6 +21,7 @@ from rewinding.interceptor import KickstartStripper
 from test_forks import (
     CHILD,
     CONV,
+    ENTER,
     add_task_logs,
     base_dir,  # noqa: F401 (a fixture)
     block_network,  # noqa: F401 (a fixture, active for every test here)
@@ -29,9 +30,11 @@ from test_forks import (
     int_field,
     open_db,
     run_cli,
+    run_real_tui,
     snapshot,
     system_message_payload,
     task_logs,
+    tool_result_payload,
 )
 
 SYSTEM_STEP = 18
@@ -941,3 +944,30 @@ def test_proxy_removes_the_system_notice_after_a_kickstart(monkeypatch, tmp_path
 ])
 def test_proxy_passes_requests_without_a_kickstart_through_unchanged(monkeypatch, tmp_path, contents):
     assert after_proxy(monkeypatch, tmp_path, contents) == contents
+
+
+# ---------------------------------------------------------------------------
+# The TUI text box cancels rather than silently dropping what was typed
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+@pytest.mark.parametrize("typed", ["한글", "abc한글", "한글abc", "é"])
+@pytest.mark.parametrize("key, step_keys", [("i", ["j"]), ("f", ["j"])], ids=["intervene", "fork"])
+def test_text_box_cancels_on_text_it_cannot_accept(base_dir, typed, key, step_keys):
+    """The keys were dropped, so an empty search text arrived, which means "replace the whole result"."""
+    before = snapshot(base_dir)
+
+    exit_code, output = run_real_tui(base_dir, 24, 100, [*step_keys, key, typed, ENTER])
+
+    assert exit_code == 0
+    assert "Traceback" not in output
+    assert "only accepts plain ASCII" in output
+    assert snapshot(base_dir) == before
+
+
+@pytest.mark.slow
+def test_text_box_still_accepts_plain_ascii(base_dir):
+    exit_code, _ = run_real_tui(base_dir, 24, 100, ["j", "i", "ORIGINAL", ENTER, "CHANGED", ENTER])
+
+    assert exit_code == 0
+    assert stored_payload(base_dir, 2) == tool_result_payload("CHANGED FILE TEXT")
