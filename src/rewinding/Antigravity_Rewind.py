@@ -2558,6 +2558,10 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             "--simulate-error, or --replace-web-content."
         )
 
+    if old_str and not new_str and web_content_text is None:
+        conn.close()
+        raise ValueError(f"The replacement text is empty, so step {result_step} would not change. Nothing was changed.")
+
     # If old_str was not specified and we have new_str to substitute into payload:
     count = 0
     new_payload = orig_payload
@@ -2645,8 +2649,9 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             new_payload, entry_count = update_inquiry_entries(new_payload, inquiry_questions, inquiry_resolved_selections)
             count += entry_count
 
-        if count == 0 and not dry_run:
-            print(f"Warning: Old string '{clean_preview(old_str, 50)}' was not found in step {result_step} step_payload.")
+        if count == 0:
+            conn.close()
+            raise ValueError(f"Could not find '{clean_preview(old_str, 50)}' in step {result_step}, so the replacement was not applied. Nothing was changed.")
 
     # Steps count calculation
     remaining_steps = cur.execute("SELECT COUNT(*) FROM steps WHERE idx <= ?", (result_step,)).fetchone()[0]
@@ -2743,13 +2748,9 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             desc_type = f"Choice '{choice}'" if choice else f"Write-in '{write_in}'"
             print(f"[DRY-RUN] Inquiry resolution ({desc_type}): '{clean_preview(new_str, 70)}'")
             print(f"[DRY-RUN] Protobuf payload substitutions: {count}")
-            if count == 0:
-                print(f"[DRY-RUN] Warning: Target string '{clean_preview(old_str or '', 50)}' was NOT found in Step {result_step} tool observation payload.")
         elif old_str or new_str:
             print(f"[DRY-RUN] String replacement: '{clean_preview(old_str or '', 50)}' -> '{clean_preview(new_str or '', 50)}'")
             print(f"[DRY-RUN] Protobuf payload substitutions: {count}")
-            if count == 0:
-                print(f"[DRY-RUN] Warning: Target string '{clean_preview(old_str or '', 50)}' was NOT found in Step {result_step} tool observation payload.")
         if web_content_text is not None:
             print(f"[DRY-RUN] Web content replacement: steps/{result_step}/content.md ({len(web_content_text)} chars)")
         if bg_task_id:
@@ -3974,6 +3975,11 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                 old_str = extracted or ""
 
         new_payload, count = replace_in_bytes(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8")) if old_str else (orig_payload, 0)
+        # With no replacement requested, such as a log option alone, there is nothing to apply
+        if count == 0 and (replace_old or new_str):
+            conn.close()
+            searched = f"'{clean_preview(old_str, 50)}'" if old_str else "the original text"
+            raise ValueError(f"Could not find {searched} in step {result_step}, so the replacement was not applied. Nothing was changed.")
         cutoff_step = result_step
 
         remaining_steps = cur.execute("SELECT COUNT(*) FROM steps WHERE idx <= ?", (cutoff_step,)).fetchone()[0]
@@ -4245,6 +4251,9 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             old_str = replace_old
             new_str = replace_new
             orig_text = proto_content or ""
+            if old_str not in orig_text:
+                conn.close()
+                raise ValueError(f"Could not find '{clean_preview(old_str, 50)}' in step {target_step}, so the replacement was not applied. Nothing was changed.")
             new_content = orig_text.replace(old_str, new_str)
         elif replace_text is not None and not (task_status or task_exit_code is not None):
             new_content = replace_text
@@ -5648,67 +5657,71 @@ def main():
             exec_base_dir = base_dir if (args.dry_run and raw_dest != raw_source) else dest_base_dir
 
             target_tid = None
-            if category in ("prompt", "model_response"):
-                execute_rewind(
-                    exec_base_dir,
-                    conv_id,
-                    target_step,
-                    dry_run=args.dry_run,
-                    source_base_dir=base_dir,
-                    arm_running=(category == "model_response")
-                )
-            elif category in ("tool_call_read", "tool_call_command", "tool_call_write", "tool_call_web", "tool_call_inquiry"):
-                execute_tool_intervene(
-                    exec_base_dir,
-                    conv_id,
-                    target_step,
-                    tool_name=detail or ("ask_question" if category == "tool_call_inquiry" else ("web_tool" if category == "tool_call_web" else ("write_tool" if category == "tool_call_write" else ("run_command" if category == "tool_call_command" else "read_tool")))),
-                    replace_old=args.replace_old,
-                    replace_new=args.replace_new,
-                    replace_text=args.replace_text,
-                    replace_file=args.replace_file,
-                    simulate_error=args.simulate_error,
-                    error_output=getattr(args, "error_output", None),
-                    replace_web_content=args.replace_web_content,
-                    choice=args.choice,
-                    write_in=args.write_in,
-                    dry_run=args.dry_run,
-                    source_base_dir=base_dir
-                )
-            elif category == "subagent_report":
-                execute_subagent_intervene(
-                    exec_base_dir,
-                    conv_id,
-                    target_step,
-                    sender_uuid=detail,
-                    child_step=getattr(args, "child_step", None),
-                    replace_old=args.replace_old,
-                    replace_new=args.replace_new,
-                    replace_text=args.replace_text,
-                    replace_file=args.replace_file,
-                    subagent_exit=args.subagent_exit or "crash",
-                    subagent_error_msg=args.subagent_error_msg,
-                    dry_run=args.dry_run,
-                    source_base_dir=base_dir
-                )
-            elif category in ("tool_call_task", "task_notification"):
-                target_tid = execute_task_intervene(
-                    exec_base_dir,
-                    conv_id,
-                    target_step,
-                    category=category,
-                    detail=detail,
-                    task_status=args.task_status,
-                    task_exit_code=args.task_exit_code,
-                    task_output=args.task_output,
-                    replace_old=args.replace_old,
-                    replace_new=args.replace_new,
-                    replace_text=args.replace_text,
-                    replace_file=args.replace_file,
-                    dry_run=args.dry_run,
-                    source_base_dir=base_dir,
-                    keep_task_log=getattr(args, "keep_task_log", False)
-                )
+            try:
+                if category in ("prompt", "model_response"):
+                    execute_rewind(
+                        exec_base_dir,
+                        conv_id,
+                        target_step,
+                        dry_run=args.dry_run,
+                        source_base_dir=base_dir,
+                        arm_running=(category == "model_response")
+                    )
+                elif category in ("tool_call_read", "tool_call_command", "tool_call_write", "tool_call_web", "tool_call_inquiry"):
+                    execute_tool_intervene(
+                        exec_base_dir,
+                        conv_id,
+                        target_step,
+                        tool_name=detail or ("ask_question" if category == "tool_call_inquiry" else ("web_tool" if category == "tool_call_web" else ("write_tool" if category == "tool_call_write" else ("run_command" if category == "tool_call_command" else "read_tool")))),
+                        replace_old=args.replace_old,
+                        replace_new=args.replace_new,
+                        replace_text=args.replace_text,
+                        replace_file=args.replace_file,
+                        simulate_error=args.simulate_error,
+                        error_output=getattr(args, "error_output", None),
+                        replace_web_content=args.replace_web_content,
+                        choice=args.choice,
+                        write_in=args.write_in,
+                        dry_run=args.dry_run,
+                        source_base_dir=base_dir
+                    )
+                elif category == "subagent_report":
+                    execute_subagent_intervene(
+                        exec_base_dir,
+                        conv_id,
+                        target_step,
+                        sender_uuid=detail,
+                        child_step=getattr(args, "child_step", None),
+                        replace_old=args.replace_old,
+                        replace_new=args.replace_new,
+                        replace_text=args.replace_text,
+                        replace_file=args.replace_file,
+                        subagent_exit=args.subagent_exit or "crash",
+                        subagent_error_msg=args.subagent_error_msg,
+                        dry_run=args.dry_run,
+                        source_base_dir=base_dir
+                    )
+                elif category in ("tool_call_task", "task_notification"):
+                    target_tid = execute_task_intervene(
+                        exec_base_dir,
+                        conv_id,
+                        target_step,
+                        category=category,
+                        detail=detail,
+                        task_status=args.task_status,
+                        task_exit_code=args.task_exit_code,
+                        task_output=args.task_output,
+                        replace_old=args.replace_old,
+                        replace_new=args.replace_new,
+                        replace_text=args.replace_text,
+                        replace_file=args.replace_file,
+                        dry_run=args.dry_run,
+                        source_base_dir=base_dir,
+                        keep_task_log=getattr(args, "keep_task_log", False)
+                    )
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                print_standout_box([f"Error: {exc}"], border_char="!", file=sys.stderr)
+                sys.exit(1)
 
             write_future_task_logs(exec_base_dir, conv_id, downstream_tasks, args.task_output,
                                    skip_task=target_tid, dry_run=args.dry_run)

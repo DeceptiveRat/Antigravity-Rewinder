@@ -736,6 +736,117 @@ def test_fork_dry_run_finds_source_files_under_the_parent_id(base_dir, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# A replacement that cannot be applied stops with an error and changes nothing
+# ---------------------------------------------------------------------------
+
+def not_found(text: str, step: int) -> str:
+    return f"Could not find '{text}' in step {step}, so the replacement was not applied. Nothing was changed."
+
+
+def empty_replacement(step: int) -> str:
+    return f"The replacement text is empty, so step {step} would not change. Nothing was changed."
+
+
+ABSENT = ["--replace-old", "NOT THERE", "--replace-new", NEW_TEXT]
+FILE_READ_RESULT = tool_result_payload("ORIGINAL FILE TEXT")
+
+
+@pytest.mark.parametrize("step, options, message", [
+    ("1", ABSENT, not_found("NOT THERE", 2)),
+    ("3", ABSENT, not_found("NOT THERE", 4)),
+    ("5", ABSENT, not_found("NOT THERE", 6)),
+    ("7", ABSENT, not_found("NOT THERE", 8)),
+    ("9", ABSENT, not_found("NOT THERE", 10)),
+    ("1", ["--replace-old", "ORIGINAL", "--replace-new", ""], empty_replacement(2)),
+    ("1", ["--replace-old", "ORIGINAL"], empty_replacement(2)),
+    ("11", ABSENT, not_found("NOT THERE", 12)),
+    ("17", ABSENT, not_found("NOT THERE", 17)),
+    ("21", ABSENT, not_found("NOT THERE", 21)),
+])
+@pytest.mark.parametrize("mode", [[], ["--dry-run"], ["--fork", "b"], ["--fork", "b", "--dry-run"]])
+def test_replacement_that_cannot_apply_stops_and_changes_nothing(base_dir, monkeypatch, capsys, step, options, message, mode):
+    """These used to delete the later steps and report success, in most cases without any warning."""
+    before = originals(base_dir)
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, step, *options, *mode)
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == error_box(message)
+    assert_no_fork_exists(base_dir)
+    assert originals(base_dir) == before
+
+
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(text=st.text(min_size=1, max_size=100).filter(
+    lambda t: t.strip() and t.encode() not in FILE_READ_RESULT and t.strip().encode() not in FILE_READ_RESULT
+))
+def test_any_absent_text_is_refused_without_changes(base_dir, text):
+    """Invariant: whatever text is searched for, if it is absent then nothing is created or changed."""
+    before = originals(base_dir)
+    with pytest.raises(ValueError) as error:
+        execute_fork(str(base_dir), CONV, 1, branch_name="b", category="tool_call_read",
+                     intervention_kwargs={"tool_name": "view_file", "replace_old": text, "replace_new": NEW_TEXT})
+    assert str(error.value).endswith("so the replacement was not applied. Nothing was changed.")
+    assert_no_fork_exists(base_dir)
+    assert originals(base_dir) == before
+
+
+def test_replacement_on_a_task_tool_call_still_applies_when_the_text_exists(base_dir, monkeypatch):
+    run_cli(monkeypatch, base_dir, "11", "--replace-old", "running", "--replace-new", "stopped")
+    assert step_payload(base_dir, CONV, 12) == tool_result_payload("task stopped")
+    assert step_indices(base_dir, CONV) == list(range(13))
+
+
+def test_replacement_on_a_notification_still_applies_when_the_text_exists(base_dir, monkeypatch):
+    run_cli(monkeypatch, base_dir, "17", "--replace-old", "exit code 0", "--replace-new", "exit code 1")
+    payload = step_payload(base_dir, CONV, 17)
+    assert b"exit code 1" in payload
+    assert b"exit code 0" not in payload
+    assert step_indices(base_dir, CONV) == list(range(18))
+
+
+def test_task_step_with_no_replacement_requested_is_not_treated_as_a_failure(base_dir, monkeypatch):
+    """A log option alone asks for no text change, so finding no text to change is not an error."""
+    add_task_logs(base_dir)
+    with sqlite3.connect(base_dir / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("UPDATE steps SET step_payload = ? WHERE idx = 12", (b"opaque",))
+    transcript = base_dir / "brain" / CONV / ".system_generated" / "logs" / "transcript_full.jsonl"
+    records = [json.loads(line) for line in transcript.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        if record["step_index"] == 12:
+            record["content"] = ""
+    transcript.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    run_cli(monkeypatch, base_dir, "11", "--keep-task-log")
+    assert step_payload(base_dir, CONV, 12) == b"opaque"
+    assert step_indices(base_dir, CONV) == list(range(13))
+
+
+@pytest.mark.parametrize("answers, message", [
+    (("NOT THERE", NEW_TEXT), not_found("NOT THERE", 2)),
+    (("ORIGINAL", ""), empty_replacement(2)),
+])
+def test_intervene_key_reports_a_replacement_that_cannot_apply(base_dir, monkeypatch, answers, message):
+    before = snapshot(base_dir)
+    app, _, _ = open_tui(monkeypatch, base_dir, 1, answers=answers)
+    app.handle_input_char(ord("i"))
+    assert app.status_msg == f"Intervention failed: {message}"
+    assert snapshot(base_dir) == before
+
+
+def test_tui_fork_key_reports_a_replacement_that_cannot_apply(base_dir, monkeypatch):
+    """When output.txt differs from the stored result, the fork used to report success with the result unchanged."""
+    output_dir = base_dir / "brain" / CONV / ".system_generated" / "steps" / "2"
+    output_dir.mkdir(parents=True)
+    (output_dir / "output.txt").write_text("TEXT ONLY IN OUTPUT FILE", encoding="utf-8")
+    before = originals(base_dir)
+    app, _, _ = open_tui(monkeypatch, base_dir, 1, answers=(NEW_TEXT, "b"))
+    app.handle_input_char(ord("f"))
+    assert app.status_msg == f"Fork failed: {not_found('TEXT ONLY IN OUTPUT FILE', 2)}"
+    assert_no_fork_exists(base_dir)
+    assert originals(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
 # TUI fork key: which steps it refuses
 # ---------------------------------------------------------------------------
 
