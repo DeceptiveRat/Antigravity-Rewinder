@@ -880,14 +880,16 @@ def test_check_task_log_discrepancy_unit(mock_task_session):
 def test_cli_task_notification_mismatch_warning_non_halting_e2e(mock_task_session, monkeypatch, capsys):
     base_dir = str(mock_task_session["base_dir"])
     conv_id = mock_task_session["conv_id"]
+    # The replaced text must be in the message for the replacement to apply, and in the log for the notice to fire
+    mock_task_session["task_log_file"].write_text("exit code 0\n", encoding="utf-8")
 
     test_argv = [
         "Antigravity_Rewind.py",
         "--dir", base_dir,
         "--conv", conv_id,
         "8",
-        "--replace-old", "SUCCESSFUL",
-        "--replace-new", "FAILED"
+        "--replace-old", "exit code 0",
+        "--replace-new", "exit code 1"
     ]
     monkeypatch.setattr(sys, "argv", test_argv)
 
@@ -899,12 +901,13 @@ def test_cli_task_notification_mismatch_warning_non_halting_e2e(mock_task_sessio
     assert "Armed conversation_summaries.db" in out
     # Verify prominent stderr warning
     assert "!" * 80 in err
-    assert "Step 8 task notification was modified, but 'tasks/task-2.log' still contains 'SUCCESSFUL'." in err
+    assert "Step 8 task notification was modified, but 'tasks/task-2.log' still contains 'exit code 0'." in err
 
 
 def test_cli_task_notification_mismatch_suppression(mock_task_session, monkeypatch, capsys):
     base_dir = str(mock_task_session["base_dir"])
     conv_id = mock_task_session["conv_id"]
+    mock_task_session["task_log_file"].write_text("exit code 0\n", encoding="utf-8")
 
     # 1. With --keep-task-log
     test_argv = [
@@ -912,8 +915,8 @@ def test_cli_task_notification_mismatch_suppression(mock_task_session, monkeypat
         "--dir", base_dir,
         "--conv", conv_id,
         "8",
-        "--replace-old", "SUCCESSFUL",
-        "--replace-new", "FAILED",
+        "--replace-old", "exit code 0",
+        "--replace-new", "exit code 1",
         "--keep-task-log"
     ]
     monkeypatch.setattr(sys, "argv", test_argv)
@@ -923,14 +926,14 @@ def test_cli_task_notification_mismatch_suppression(mock_task_session, monkeypat
     assert "Successfully executed Intervene Mode" in out
     assert "Step 8 task notification was modified" not in err
 
-    # 2. With --task-output
+    # 2. With --task-output (the first run already changed the message to exit code 1)
     test_argv2 = [
         "Antigravity_Rewind.py",
         "--dir", base_dir,
         "--conv", conv_id,
         "8",
-        "--replace-old", "SUCCESSFUL",
-        "--replace-new", "FAILED",
+        "--replace-old", "exit code 1",
+        "--replace-new", "exit code 2",
         "--task-output", "BUILD FAILED MANUALLY"
     ]
     monkeypatch.setattr(sys, "argv", test_argv2)
@@ -945,6 +948,7 @@ def test_cli_task_notification_mismatch_suppression(mock_task_session, monkeypat
 def test_cli_task_notification_mismatch_dry_run(mock_task_session, monkeypatch, capsys):
     base_dir = str(mock_task_session["base_dir"])
     conv_id = mock_task_session["conv_id"]
+    mock_task_session["task_log_file"].write_text("exit code 0\n", encoding="utf-8")
 
     test_argv = [
         "Antigravity_Rewind.py",
@@ -952,14 +956,14 @@ def test_cli_task_notification_mismatch_dry_run(mock_task_session, monkeypatch, 
         "--conv", conv_id,
         "8",
         "--dry-run",
-        "--replace-old", "SUCCESSFUL",
-        "--replace-new", "FAILED"
+        "--replace-old", "exit code 0",
+        "--replace-new", "exit code 1"
     ]
     monkeypatch.setattr(sys, "argv", test_argv)
 
     main()
     out, err = capsys.readouterr()
     assert "[DRY-RUN]" in out
-    assert "Step 8 task notification was modified, but 'tasks/task-2.log' still contains 'SUCCESSFUL'." in err
-    assert mock_task_session["task_log_file"].read_text(encoding="utf-8") == "BUILD SUCCESSFUL\n"
+    assert "Step 8 task notification was modified, but 'tasks/task-2.log' still contains 'exit code 0'." in err
+    assert mock_task_session["task_log_file"].read_text(encoding="utf-8") == "exit code 0\n"
 

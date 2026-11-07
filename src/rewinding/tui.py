@@ -21,9 +21,25 @@ detect_step_info = rewind_mod.detect_step_info
 execute_rewind = rewind_mod.execute_rewind
 execute_tool_intervene = rewind_mod.execute_tool_intervene
 execute_fork = getattr(rewind_mod, "execute_fork", None)
+find_downstream_task_completions = rewind_mod.find_downstream_task_completions
+find_future_task_logs = rewind_mod.find_future_task_logs
+write_future_task_logs = rewind_mod.write_future_task_logs
 clean_preview = rewind_mod.clean_preview
 STEP_TYPE_USER_INPUT = rewind_mod.STEP_TYPE_USER_INPUT
 STEP_TYPE_MODEL_RESPONSE = rewind_mod.STEP_TYPE_MODEL_RESPONSE
+
+# The fork key asks for replacement text on these steps, since changing their result is the point of forking there
+REPLACEABLE_CATEGORIES = rewind_mod.TOOL_INTERVENTION_CATEGORIES + rewind_mod.TASK_INTERVENTION_CATEGORIES
+FORKABLE_CATEGORIES = ("prompt", "model_response") + REPLACEABLE_CATEGORIES
+
+
+def clear_log_spec(future_tasks: list[tuple[str, int, int]]) -> list[str]:
+    """Builds a task output spec that empties exactly these logs and leaves every other log alone."""
+    return [f"{task_id}=" for task_id, _, _ in future_tasks]
+
+
+def task_logs_kept_message(future_tasks: list[tuple[str, int, int]]) -> str:
+    return f"Cancelled: {len(future_tasks)} task log(s) would keep future output."
 
 
 @dataclass
@@ -277,13 +293,19 @@ class RewindTUIApp:
             return self.loader.steps[self.cursor]
         return None
 
-    def execute_action_rewind(self, arm_running: bool = False) -> tuple[bool, str]:
+    def execute_action_rewind(self, arm_running: bool = False, clear_task_logs: bool = False) -> tuple[bool, str]:
         """Performs rewind action on the currently selected step."""
         step = self.get_selected_step()
         if not step:
             return False, "No step selected."
 
         try:
+            future_tasks = find_downstream_task_completions(self.base_dir, self.conv_id, step.idx)
+            if future_tasks and not clear_task_logs:
+                msg = task_logs_kept_message(future_tasks)
+                self.status_msg = msg
+                return False, msg
+
             execute_rewind(
                 self.base_dir,
                 self.conv_id,
@@ -291,6 +313,7 @@ class RewindTUIApp:
                 dry_run=self.dry_run,
                 arm_running=arm_running
             )
+            write_future_task_logs(self.base_dir, self.conv_id, future_tasks, clear_log_spec(future_tasks), dry_run=self.dry_run)
             if not self.dry_run:
                 self.loader.reload()
                 self.cursor = max(0, min(self.cursor, len(self.loader.steps) - 1))
@@ -305,7 +328,8 @@ class RewindTUIApp:
             return False, msg
 
     def execute_action_intervene(self, replace_old: str = None, replace_new: str = None,
-                                  replace_text: str = None, simulate_error: str = None) -> tuple[bool, str]:
+                                  replace_text: str = None, simulate_error: str = None,
+                                  clear_task_logs: bool = False) -> tuple[bool, str]:
         """Performs intervention action on the currently selected step."""
         step = self.get_selected_step()
         if not step:
@@ -317,6 +341,12 @@ class RewindTUIApp:
             return False, msg
 
         try:
+            future_tasks = find_future_task_logs(self.base_dir, self.conv_id, step.idx, step.category, simulate_error)
+            if future_tasks and not clear_task_logs:
+                msg = task_logs_kept_message(future_tasks)
+                self.status_msg = msg
+                return False, msg
+
             execute_tool_intervene(
                 self.base_dir,
                 self.conv_id,
@@ -328,6 +358,7 @@ class RewindTUIApp:
                 simulate_error=simulate_error,
                 dry_run=self.dry_run
             )
+            write_future_task_logs(self.base_dir, self.conv_id, future_tasks, clear_log_spec(future_tasks), dry_run=self.dry_run)
             if not self.dry_run:
                 self.loader.reload()
                 self.cursor = max(0, min(self.cursor, len(self.loader.steps) - 1))
@@ -340,29 +371,59 @@ class RewindTUIApp:
             self.status_msg = msg
             return False, msg
 
-    def execute_action_fork(self, branch_name: str = "branch", arm_running: bool = False) -> tuple[bool, str, str | None]:
+    def _fork_category(self, step: StepItem, arm_running: bool) -> str:
+        """Returns the category a fork at this step acts as. Forking before a response treats tool calls as responses."""
+        if arm_running and step.category.startswith("tool_call_"):
+            return "model_response"
+        return step.category
+
+    def _fork_refusal(self, step: StepItem, arm_running: bool) -> str | None:
+        """Explains why the selected step cannot be forked, or returns None if it can."""
+        category = self._fork_category(step, arm_running)
+        if category in FORKABLE_CATEGORIES:
+            return None
+        if category == "tool_result":
+            return f"Cannot fork at a tool result; select the tool call at step {step.idx - 1}."
+        if category == "subagent_report":
+            return "Cannot fork at a subagent report yet; it would change the shared subagent."
+        if category == "tool_call_other":
+            return f"Cannot fork at step {step.idx}: results of {step.detail} cannot be changed."
+        return f"Cannot fork at step {step.idx}: {category} steps cannot be changed."
+
+    def execute_action_fork(self, branch_name: str = "branch", arm_running: bool = False,
+                            replace_text: str = None, clear_task_logs: bool = False) -> tuple[bool, str, str | None]:
         """Performs non-destructive fork action at the currently selected step."""
         step = self.get_selected_step()
         if not step:
             return False, "No step selected.", None
 
+        refusal = self._fork_refusal(step, arm_running)
+        if refusal:
+            self.status_msg = refusal
+            return False, refusal, None
+
         if execute_fork is None:
             return False, "execute_fork function is not available.", None
 
-        category = step.category
-        if arm_running:
-            if category.startswith("tool_call_") or category == "model_response":
-                category = "model_response"
+        category = self._fork_category(step, arm_running)
+        intervention_kwargs = {}
+        if category in rewind_mod.TOOL_INTERVENTION_CATEGORIES:
+            intervention_kwargs = {"tool_name": step.detail or "tool", "replace_text": replace_text}
+        elif category in rewind_mod.TASK_INTERVENTION_CATEGORIES:
+            intervention_kwargs = {"detail": step.detail, "replace_text": replace_text}
 
         try:
+            future_tasks = find_future_task_logs(self.base_dir, self.conv_id, step.idx, category)
             fork_cid = execute_fork(
                 base_dir=self.base_dir,
                 parent_conv_id=self.conv_id,
                 target_step=step.idx,
                 branch_name=branch_name,
                 dry_run=self.dry_run,
-                arm_running=arm_running,
-                category=category
+                arm_running=(category == "model_response"),
+                category=category,
+                intervention_kwargs=intervention_kwargs,
+                task_output=(clear_log_spec(future_tasks) if clear_task_logs and future_tasks else None)
             )
             mode_tag = " [DRY-RUN]" if self.dry_run else ""
             msg = f"Forked to branch '{branch_name}' ({fork_cid[:8]}...){mode_tag}."
@@ -658,8 +719,21 @@ class RewindTUIApp:
         prompt = f"Rewind {label}? Deletes {downstream} downstream step(s). [y/N]: "
 
         confirmed = self._show_confirm_dialog(prompt)
-        if confirmed:
-            self.execute_action_rewind(arm_running=arm_running)
+        if not confirmed:
+            return
+
+        future_tasks = find_downstream_task_completions(self.base_dir, self.conv_id, step.idx)
+        if self._ask_to_clear_task_logs(future_tasks):
+            self.execute_action_rewind(arm_running=arm_running, clear_task_logs=True)
+
+    def _ask_to_clear_task_logs(self, future_tasks: list[tuple[str, int, int]]) -> bool:
+        """Asks whether to empty logs holding future output. Returns False if the action should be cancelled."""
+        if not future_tasks:
+            return True
+        if self._show_confirm_dialog(f"{len(future_tasks)} task log(s) hold future output. Clear them? [y/N]: "):
+            return True
+        self.status_msg = task_logs_kept_message(future_tasks)
+        return False
 
     def _prompt_and_fork(self, arm_running: bool = False):
         """Input dialog and confirmation before executing conversation fork."""
@@ -667,12 +741,34 @@ class RewindTUIApp:
         if not step:
             return
 
+        refusal = self._fork_refusal(step, arm_running)
+        if refusal:
+            self.status_msg = refusal
+            return
+
+        category = self._fork_category(step, arm_running)
+        replace_text = None
+        if category in REPLACEABLE_CATEGORIES:
+            noun = "tool result" if category.startswith("tool_call_") else "message"
+            replace_text = self._show_input_dialog(f"Replacement text for the whole {noun}:")
+            if replace_text is None or not replace_text.strip():
+                self.status_msg = "Fork cancelled: no replacement text given."
+                return
+
         branch_name = self._show_input_dialog(f"Fork @ Step {step.idx} - Branch Name (default: 'branch'):")
         if branch_name is None:
             return
         branch_name = branch_name.strip() or "branch"
 
-        success, msg, new_cid = self.execute_action_fork(branch_name=branch_name, arm_running=arm_running)
+        if not self._ask_to_clear_task_logs(find_future_task_logs(self.base_dir, self.conv_id, step.idx, category)):
+            return
+
+        success, msg, new_cid = self.execute_action_fork(
+            branch_name=branch_name,
+            arm_running=arm_running,
+            replace_text=replace_text,
+            clear_task_logs=True
+        )
         if success and not self.dry_run and new_cid:
             switch_now = self._show_confirm_dialog(f"Forked to {new_cid[:8]}... Switch TUI to new branch? [y/N]:")
             if switch_now:
@@ -699,7 +795,8 @@ class RewindTUIApp:
         if new_str is None:
             return
 
-        self.execute_action_intervene(replace_old=old_str, replace_new=new_str)
+        if self._ask_to_clear_task_logs(find_future_task_logs(self.base_dir, self.conv_id, step.idx, step.category)):
+            self.execute_action_intervene(replace_old=old_str, replace_new=new_str, clear_task_logs=True)
 
     def _show_confirm_dialog(self, prompt: str) -> bool:
         """Displays a simple yes/no modal popup."""
