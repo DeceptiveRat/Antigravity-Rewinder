@@ -774,8 +774,22 @@ def test_intervene_key_reports_a_replacement_that_cannot_apply(base_dir, monkeyp
     assert snapshot(base_dir) == before
 
 
+def test_tui_fork_key_replaces_a_result_whose_output_file_differs(base_dir, monkeypatch):
+    """A stale output.txt once left the stored result unchanged, while the fork reported success."""
+    output_dir = base_dir / "brain" / CONV / ".system_generated" / "steps" / "2"
+    output_dir.mkdir(parents=True)
+    (output_dir / "output.txt").write_text("TEXT ONLY IN OUTPUT FILE", encoding="utf-8")
+    app, _, _ = open_tui(monkeypatch, base_dir, 1, answers=(NEW_TEXT, "b"))
+    app.handle_input_char(ord("f"))
+    fork_id = only_fork(base_dir)[0]
+    assert app.status_msg == f"Forked to branch 'b' ({fork_id[:8]}...)."
+    assert step_payload(base_dir, fork_id, 2) == tool_result_payload(NEW_TEXT)
+
+
 def test_tui_fork_key_reports_a_replacement_that_cannot_apply(base_dir, monkeypatch):
-    """When output.txt differs from the stored result, the fork used to report success with the result unchanged."""
+    """A result storing no text at all, as some real ones do, must fail rather than report success."""
+    with open_db(base_dir / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("UPDATE steps SET step_payload = ? WHERE idx = 2", (int_field(1, 132) + int_field(4, 3),))
     output_dir = base_dir / "brain" / CONV / ".system_generated" / "steps" / "2"
     output_dir.mkdir(parents=True)
     (output_dir / "output.txt").write_text("TEXT ONLY IN OUTPUT FILE", encoding="utf-8")
@@ -1629,7 +1643,7 @@ def test_whole_replacement_applies_to_a_real_shaped_result(base_dir, monkeypatch
     set_real_result(base_dir, result, text)
     run_cli(monkeypatch, base_dir, str(call), "--replace-text", NEW_TEXT, *fork_options)
     conv_id = only_fork(base_dir)[0] if fork_options else CONV
-    assert step_payload(base_dir, conv_id, result) == real_result_payload(NEW_TEXT)
+    assert step_payload(base_dir, conv_id, result) == real_result_payload(NEW_TEXT, NEW_TEXT)
 
 
 @pytest.mark.parametrize("call, result", TOOL_CALLS_AND_RESULTS)
@@ -1648,7 +1662,7 @@ def test_tui_fork_key_replaces_a_real_shaped_result(base_dir, monkeypatch, call,
     set_real_result(base_dir, result, CRLF_OUTPUT)
     app, _, _ = open_tui(monkeypatch, base_dir, call, answers=(NEW_TEXT, "b"))
     app.handle_input_char(ord("f"))
-    assert step_payload(base_dir, only_fork(base_dir)[0], result) == real_result_payload(NEW_TEXT)
+    assert step_payload(base_dir, only_fork(base_dir)[0], result) == real_result_payload(NEW_TEXT, NEW_TEXT)
 
 
 def test_command_replacement_also_updates_its_recorded_output(base_dir, monkeypatch):

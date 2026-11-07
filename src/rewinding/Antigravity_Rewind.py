@@ -878,7 +878,8 @@ def truncate_lines(lines, target_step: int) -> tuple[list[str], int]:
 
 
 def modify_or_truncate_lines(lines, cutoff_step: int, modify_step: int = None, old_str: str = None,
-                             new_str: str = None, dry_run: bool = False) -> tuple[list[str], int]:
+                             new_str: str = None, dry_run: bool = False,
+                             whole_result: bool = False) -> tuple[list[str], int]:
     """
     Keeps lines with step_index <= cutoff_step, removing any lines with step_index > cutoff_step.
     If modify_step is specified, updates content for that step using update_transcript_content.
@@ -896,7 +897,7 @@ def modify_or_truncate_lines(lines, cutoff_step: int, modify_step: int = None, o
                 continue
             if idx is not None and idx == modify_step and not dry_run:
                 content = data.get("content", "")
-                data["content"] = update_transcript_content(content, old_str, new_str or "")
+                data["content"] = update_transcript_content(content, old_str, new_str or "", whole_result)
                 if data.get("status") == "RUNNING":
                     data["status"] = "DONE"
                 if "completed_at" not in data or not data.get("completed_at"):
@@ -928,12 +929,13 @@ def count_or_truncate_jsonl(path: str, target_step: int, dry_run: bool = False) 
 
 
 def modify_or_truncate_jsonl(path: str, cutoff_step: int, modify_step: int = None,
-                              old_str: str = None, new_str: str = None, dry_run: bool = False) -> int:
+                              old_str: str = None, new_str: str = None, dry_run: bool = False,
+                              whole_result: bool = False) -> int:
     """Applies modify_or_truncate_lines to a transcript file. Returns number of removed lines."""
     if not os.path.exists(path):
         return 0
     with open(path, "r", encoding="utf-8") as f:
-        kept, removed = modify_or_truncate_lines(f, cutoff_step, modify_step, old_str, new_str, dry_run)
+        kept, removed = modify_or_truncate_lines(f, cutoff_step, modify_step, old_str, new_str, dry_run, whole_result)
     if not dry_run:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
@@ -978,11 +980,12 @@ def count_or_truncate_chunks(chunks_dir: str, target_step: int, dry_run: bool = 
 
 
 def modify_or_truncate_chunks(chunks_dir: str, cutoff_step: int, modify_step: int = None,
-                              old_str: str = None, new_str: str = None, dry_run: bool = False) -> tuple[int, int]:
+                              old_str: str = None, new_str: str = None, dry_run: bool = False,
+                              whole_result: bool = False) -> tuple[int, int]:
     """Truncates chunk files keeping steps <= cutoff_step. Returns (removed_lines, deleted_files)."""
     return rewrite_chunks(
         chunks_dir,
-        lambda lines: modify_or_truncate_lines(lines, cutoff_step, modify_step, old_str, new_str, dry_run),
+        lambda lines: modify_or_truncate_lines(lines, cutoff_step, modify_step, old_str, new_str, dry_run, whole_result),
         dry_run
     )
 
@@ -1165,6 +1168,165 @@ def replace_in_bytes(data: bytes, old_bytes: bytes, new_bytes: bytes) -> tuple[b
         return data.replace(old_bytes, new_bytes), count
 
 
+# Parts of a tool result that never hold its text: step metadata, the tool call's arguments, labels, the type of a
+# wrapped message, the background task record, and the output file's path. A result can also wrap a copy of its
+# whole step, with its own metadata.
+RESULT_FIELDS_TO_KEEP = frozenset({
+    (5,), (133,), (147,), (148,),
+    (140, 1),
+    (140, 2, 3, 1), (140, 2, 3, 5), (140, 2, 3, 6), (140, 2, 3, 7), (140, 2, 3, 9),
+    (140, 2, 3, 10, 3, 1), (140, 2, 3, 10, 3, 2),
+    (140, 2, 6, 1), (140, 2, 6, 2, 5), (140, 2, 6, 2, 6), (140, 2, 6, 2, 7), (140, 2, 6, 2, 133), (140, 2, 6, 2, 147),
+    (140, 2, 7),
+})
+
+# Fields holding the text of a tool result, in the formats found in real sessions. One result can have several.
+RESULT_TEXT_FIELDS = frozenset({
+    (14, 4),
+    (140, 2, 1),
+    (140, 2, 3, 10, 1),
+    (140, 2, 3, 10, 3, 4),
+    (140, 2, 6, 2, 14, 4),
+    (140, 2, 6, 2, 28, 21, 1),
+    (140, 2, 6, 2, 42, 5),
+})
+
+UUID_BYTES = re.compile(rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+# Note that file views put before their numbered lines. Everything from here to the end of its line is the note.
+LINE_NUMBER_NOTE = "The following code has been modified to include a line number before every line"
+NUMBERED_LINE = re.compile(r"(\d+):(?: (.*))?", re.DOTALL)
+
+
+def split_numbered_text(content: str) -> tuple[str, int, list[str], str] | None:
+    """
+    Splits a file view into the text up to its numbered lines, the first line's number, the lines without
+    their numbers, and the text after them. Returns None if the text has no numbered lines.
+    """
+    start = content.find(LINE_NUMBER_NOTE)
+    if start == -1:
+        return None
+    note_end = content.find("\n", start)
+    if note_end == -1:
+        return None
+    head = content[:note_end + 1]
+    lines = content[note_end + 1:].split("\n")
+    first_number = None
+    texts = []
+    for line in lines:
+        match = NUMBERED_LINE.fullmatch(line)
+        if not match:
+            break
+        if first_number is None:
+            first_number = int(match.group(1))
+        texts.append(match.group(2) or "")
+    if first_number is None:
+        return None
+    return head, first_number, texts, "\n".join(lines[len(texts):])
+
+
+def join_numbered_text(head: str, first_number: int, text: str, tail: str) -> str:
+    numbered = [f"{first_number + i}: {line}" for i, line in enumerate(text.split("\n"))]
+    return head + "\n".join(numbered) + "\n" + tail
+
+
+def replace_in_numbered_text(content: str, old_str: str, new_str: str) -> str | None:
+    """Replaces text in a file view, where text spanning lines is broken up by the numbers. None if absent."""
+    parts = split_numbered_text(content)
+    if parts is None:
+        return None
+    head, first_number, texts, tail = parts
+    raw = "\n".join(texts)
+    if old_str not in raw:
+        return None
+    return join_numbered_text(head, first_number, raw.replace(old_str, new_str), tail)
+
+
+def tool_argument_values(payload: bytes) -> set[bytes]:
+    """Returns the values of the tool call's arguments in Field 140.1, which result records repeat word for word."""
+    values = set()
+    try:
+        for fn, wt, val in parse_fields(payload):
+            if fn == 140 and wt == 2:
+                for sfn, swt, sval in parse_fields(val):
+                    if sfn == 1 and swt == 2:
+                        values.update(kval for kfn, kwt, kval in parse_fields(sval) if kfn == 2 and kwt == 2)
+    except ValueError:
+        pass
+    return values
+
+
+def replace_in_result(data: bytes, old_bytes: bytes, new_bytes: bytes, path: tuple[int, ...] = (),
+                      arguments: set[bytes] = None) -> tuple[bytes, int]:
+    """
+    Replaces text in a tool result, recalculating the lengths around it. Metadata, identifiers and copies of the
+    call's arguments stay as they are, or a short search text such as "1" would rewrite the conversation ID
+    without changing what the agent was told.
+    """
+    if not old_bytes:
+        return data, 0
+    if arguments is None:
+        arguments = tool_argument_values(data)
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        return data.replace(old_bytes, new_bytes), data.count(old_bytes)
+
+    new_fields = []
+    total_count = 0
+    for fn, wt, val in fields:
+        here = path + (fn,)
+        if wt == 2 and here not in RESULT_FIELDS_TO_KEEP and not UUID_BYTES.fullmatch(val):
+            count = 0
+            if here == (140, 2, 1):
+                numbered = None
+                try:
+                    numbered = replace_in_numbered_text(val.decode("utf-8"), old_bytes.decode("utf-8"), new_bytes.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pass
+                if numbered is not None:
+                    val = numbered.encode("utf-8")
+                    count = 1
+            if count == 0 and old_bytes in val:
+                if here in RESULT_TEXT_FIELDS:
+                    count = val.count(old_bytes)
+                    val = val.replace(old_bytes, new_bytes)
+                elif val not in arguments:
+                    val, count = replace_in_result(val, old_bytes, new_bytes, here, arguments)
+            total_count += count
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields), total_count
+
+
+def set_result_text(data: bytes, new_text: str, path: tuple[int, ...] = ()) -> tuple[bytes, int]:
+    """
+    Replaces the whole text of a tool result in every field known to hold it. Copies of the text differ in format,
+    so searching for one copy would leave the others unchanged. Returns the new bytes and the number of fields set.
+    """
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        return data, 0
+
+    new_fields = []
+    total_count = 0
+    for fn, wt, val in fields:
+        here = path + (fn,)
+        if wt == 2:
+            if here in RESULT_TEXT_FIELDS:
+                parts = split_numbered_text(val.decode("utf-8", errors="ignore"))
+                if here == (140, 2, 1) and parts:
+                    val = join_numbered_text(parts[0], parts[1], new_text, parts[3]).encode("utf-8")
+                else:
+                    val = new_text.encode("utf-8")
+                total_count += 1
+            elif any(field[:len(here)] == here for field in RESULT_TEXT_FIELDS):
+                val, count = set_result_text(val, new_text, here)
+                total_count += count
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields), total_count
+
+
 def find_field_14_4(data: bytes) -> str | None:
     """Extracts raw view_file text from protobuf payload (Field 14.4)."""
     try:
@@ -1184,195 +1346,169 @@ def find_field_14_4(data: bytes) -> str | None:
     return None
 
 
+def read_field(data: bytes, path: tuple[int, ...]) -> bytes | None:
+    """Returns the first value at a field path, or None if the path is absent or the data does not parse."""
+    for number in path:
+        try:
+            data = next(val for fn, wt, val in parse_fields(data) if fn == number and wt == 2)
+        except (ValueError, StopIteration):
+            return None
+    return data
+
+
 def find_field_140_2(data: bytes) -> str | None:
-    """Extracts raw tool observation text from protobuf payload (Field 140.2)."""
-    try:
-        fields = parse_fields(data)
-        for fn, wt, val in fields:
-            if fn == 140 and wt == 2 and isinstance(val, bytes):
-                sub = parse_fields(val)
-                for sfn, swt, sval in sub:
-                    if sfn == 2 and swt == 2 and isinstance(sval, bytes):
-                        try:
-                            nested = parse_fields(sval)
-                            for nfn, nwt, nval in nested:
-                                if isinstance(nval, bytes):
-                                    return nval.decode("utf-8", errors="ignore")
-                        except Exception:
-                            pass
-                        return sval.decode("utf-8", errors="ignore")
-            elif wt == 2 and isinstance(val, bytes):
-                res = find_field_140_2(val)
-                if res:
-                    return res
-    except Exception:
-        pass
+    """Extracts the text of a tool result from Field 140.2. Other bytes there are nested messages, not text."""
+    for path in ((140, 2, 1), (140, 2, 3, 10, 3, 4), (140, 2, 3, 10, 1)):
+        text = read_field(data, path)
+        if text:
+            return text.decode("utf-8", errors="ignore")
     return None
 
 
-def update_command_result_payload(
-    orig_payload: bytes,
-    exit_code: int | None = None,
-    error_output: str | None = None,
-    old_output: str | None = None,
-    new_output: str | None = None,
-    strip_background: bool = False
-) -> tuple[bytes, bool]:
+def command_result_text(original: bytes | None, exit_code: int, output: str | None) -> str:
+    """Words a simulated result the way the session's real results are worded, so the format gives nothing away."""
+    if original and original.startswith(b"Command "):
+        first_line = f"Command exited with code {exit_code}."
+        return f"{first_line}\n\nCommand output:\n{output.strip()}\n" if output else f"{first_line}\n"
+    if output:
+        return f"\nThe command exited with code {exit_code}.\nOutput:\n{output.strip()}\r\n\n"
+    return f"\nThe command exited with code {exit_code}.\r\n\n"
+
+
+def update_command_result_payload(orig_payload: bytes, exit_code: int, error_output: str | None = None,
+                                  strip_background: bool = False) -> tuple[bytes, bool]:
     """
-    Updates the protobuf step_payload of a command execution (run_command / send_command_input).
+    Rewrites the protobuf step_payload of a command (run_command / send_command_input) as a finished run:
     - If strip_background is True, strips top-level Field 148 (BackgroundTaskInfo), converting
       a background task launch into a completed synchronous result.
-    - Updates Field 140.2.1 observation string to reflect the exit code and error output (or performs replacement).
-    - Updates Field 140.2.6 Any (gemini_coder.Step -> CortexStepRunCommand / Field 28):
-      - Field 6 (ExitCode) is updated if exit_code is provided.
-      - Field 21 (CombinedOutput) is updated or replaced.
-      - Field 11 is set to 1 (marking execution complete).
+    - Sets Field 140.2.1 (observation text) to report the exit code and output.
+    - Updates the command record, which is either Field 140.2.3.10.3 (3: exit code, 4: output), or
+      Field 140.2.6 Any (gemini_coder.Step -> CortexStepRunCommand / Field 28), where Field 6 is the exit code,
+      Field 21 the output, and Field 11 marks the run as complete.
     """
+    output = error_output.strip() if error_output else ""
+    modified = False
+
+    def update_any(any_bytes: bytes) -> bytes:
+        nonlocal modified
+        any_fields = parse_fields(any_bytes)
+        new_any = []
+        for afn, awt, aval in any_fields:
+            if afn == 2 and awt == 2:
+                new_step = []
+                for st_fn, st_wt, st_val in parse_fields(aval):
+                    if st_fn == 28 and st_wt == 2:
+                        out_bytes = serialize_fields([(1, 2, (output + "\r\n").encode("utf-8"))]) if output else b""
+                        seen = set()
+                        new_cmd = []
+                        for cfn, cwt, cval in parse_fields(st_val):
+                            seen.add(cfn)
+                            if cfn == 6:
+                                new_cmd.append((6, 0, exit_code))
+                            elif cfn == 21:
+                                new_cmd.append((21, 2, out_bytes))
+                            elif cfn == 11:
+                                new_cmd.append((11, 0, 1))
+                            else:
+                                new_cmd.append((cfn, cwt, cval))
+                        if 6 not in seen:
+                            new_cmd.append((6, 0, exit_code))
+                        if 11 not in seen:
+                            new_cmd.append((11, 0, 1))
+                        if 21 not in seen and output:
+                            new_cmd.append((21, 2, out_bytes))
+                        st_val = serialize_fields(new_cmd)
+                        modified = True
+                    new_step.append((st_fn, st_wt, st_val))
+                aval = serialize_fields(new_step)
+            new_any.append((afn, awt, aval))
+        return serialize_fields(new_any)
+
+    def update_record(record: bytes) -> bytes:
+        nonlocal modified
+        seen = set()
+        new_record = []
+        for rfn, rwt, rval in parse_fields(record):
+            seen.add(rfn)
+            if rfn == 3:
+                new_record.append((3, 0, exit_code))
+            elif rfn == 4:
+                new_record.append((4, 2, output.encode("utf-8")))
+            else:
+                new_record.append((rfn, rwt, rval))
+        if 3 not in seen:
+            new_record.append((3, 0, exit_code))
+        if 4 not in seen and output:
+            new_record.append((4, 2, output.encode("utf-8")))
+        modified = True
+        return serialize_fields(new_record)
+
     try:
-        top_fields = parse_fields(orig_payload)
+        original_text = read_field(orig_payload, (140, 2, 1))
+        new_text = command_result_text(original_text, exit_code, output)
         new_top = []
-        modified = False
-        for fn, wt, val in top_fields:
+        for fn, wt, val in parse_fields(orig_payload):
             if fn == 148 and strip_background:
                 modified = True
                 continue
-            if fn == 140 and wt == 2 and isinstance(val, bytes):
-                f140_fields = parse_fields(val)
+            if fn == 140 and wt == 2:
                 new_f140 = []
-                for sfn, swt, sval in f140_fields:
-                    if sfn == 2 and swt == 2 and isinstance(sval, bytes):
-                        sub2_fields = parse_fields(sval)
+                for sfn, swt, sval in parse_fields(val):
+                    if sfn == 2 and swt == 2:
                         new_sub2 = []
-                        for s2fn, s2wt, s2val in sub2_fields:
-                            if s2fn == 1 and s2wt == 2 and isinstance(s2val, bytes):
-                                if exit_code is not None:
-                                    if error_output:
-                                        obs = f"\nThe command exited with code {exit_code}.\nOutput:\n{error_output.strip()}\r\n\n"
-                                    else:
-                                        obs = f"\nThe command exited with code {exit_code}.\r\n\n"
-                                    new_sub2.append((s2fn, s2wt, obs.encode("utf-8")))
-                                    modified = True
-                                elif old_output and new_output and old_output.encode("utf-8") in s2val:
-                                    new_s2val = s2val.replace(old_output.encode("utf-8"), new_output.encode("utf-8"))
-                                    new_sub2.append((s2fn, s2wt, new_s2val))
-                                    modified = True
-                                elif old_output and new_output and old_output.strip().encode("utf-8") in s2val:
-                                    new_s2val = s2val.replace(old_output.strip().encode("utf-8"), new_output.strip().encode("utf-8"))
-                                    new_sub2.append((s2fn, s2wt, new_s2val))
-                                    modified = True
-                                else:
-                                    new_sub2.append((s2fn, s2wt, s2val))
-                            elif s2fn == 6 and s2wt == 2 and isinstance(s2val, bytes):
+                        for s2fn, s2wt, s2val in parse_fields(sval):
+                            if s2fn == 1 and s2wt == 2:
+                                s2val = new_text.encode("utf-8")
+                                modified = True
+                            elif s2fn == 3 and s2wt == 2:
+                                new_s3 = []
+                                for s3fn, s3wt, s3val in parse_fields(s2val):
+                                    if s3fn == 10 and s3wt == 2:
+                                        new_s10 = []
+                                        for tfn, twt, tval in parse_fields(s3val):
+                                            new_s10.append((tfn, twt, update_record(tval) if tfn == 3 and twt == 2 else tval))
+                                        s3val = serialize_fields(new_s10)
+                                    new_s3.append((s3fn, s3wt, s3val))
+                                s2val = serialize_fields(new_s3)
+                            elif s2fn == 6 and s2wt == 2:
                                 try:
-                                    any_fields = parse_fields(s2val)
-                                    type_url = None
-                                    step_data = None
-                                    for afn, awt, aval in any_fields:
-                                        if afn == 1 and awt == 2:
-                                            type_url = aval
-                                        elif afn == 2 and awt == 2:
-                                            step_data = aval
-                                    if type_url and step_data:
-                                        st_fields = parse_fields(step_data)
-                                        new_st = []
-                                        for st_fn, st_wt, st_val in st_fields:
-                                            if st_fn == 28 and st_wt == 2 and isinstance(st_val, bytes):
-                                                cmd_fields = parse_fields(st_val)
-                                                new_cmd = []
-                                                has_f6 = False
-                                                has_f11 = False
-                                                has_f21 = False
-                                                out_bytes = serialize_fields([(1, 2, (error_output.strip() + "\r\n").encode("utf-8"))]) if error_output else b""
-                                                for cfn, cwt, cval in cmd_fields:
-                                                    if cfn == 6 and exit_code is not None:
-                                                        has_f6 = True
-                                                        new_cmd.append((cfn, 0, exit_code))
-                                                    elif cfn == 21:
-                                                        has_f21 = True
-                                                        if exit_code is not None:
-                                                            new_cmd.append((cfn, 2, out_bytes))
-                                                        elif old_output and new_output and isinstance(cval, bytes):
-                                                            try:
-                                                                sub_c = parse_fields(cval)
-                                                                new_sub_c = []
-                                                                sub_mod = False
-                                                                for sc_fn, sc_wt, sc_val in sub_c:
-                                                                    if sc_fn == 1 and isinstance(sc_val, bytes):
-                                                                        if old_output.encode("utf-8") in sc_val:
-                                                                            sc_val = sc_val.replace(old_output.encode("utf-8"), new_output.encode("utf-8"))
-                                                                            sub_mod = True
-                                                                        elif old_output.strip().encode("utf-8") in sc_val:
-                                                                            sc_val = sc_val.replace(old_output.strip().encode("utf-8"), new_output.strip().encode("utf-8"))
-                                                                            sub_mod = True
-                                                                    new_sub_c.append((sc_fn, sc_wt, sc_val))
-                                                                if sub_mod:
-                                                                    new_cmd.append((cfn, 2, serialize_fields(new_sub_c)))
-                                                                    modified = True
-                                                                else:
-                                                                    new_cmd.append((cfn, cwt, cval))
-                                                            except Exception:
-                                                                new_cmd.append((cfn, cwt, cval))
-                                                        else:
-                                                            new_cmd.append((cfn, cwt, cval))
-                                                    elif cfn == 11 and exit_code is not None:
-                                                        has_f11 = True
-                                                        new_cmd.append((cfn, 0, 1))
-                                                    else:
-                                                        new_cmd.append((cfn, cwt, cval))
-                                                if exit_code is not None:
-                                                    if not has_f6:
-                                                        new_cmd.append((6, 0, exit_code))
-                                                    if not has_f11:
-                                                        new_cmd.append((11, 0, 1))
-                                                    if not has_f21 and error_output:
-                                                        new_cmd.append((21, 2, out_bytes))
-                                                new_st.append((st_fn, st_wt, serialize_fields(new_cmd)))
-                                                if exit_code is not None:
-                                                    modified = True
-                                            else:
-                                                new_st.append((st_fn, st_wt, st_val))
-                                        new_any = [(1, 2, type_url), (2, 2, serialize_fields(new_st))]
-                                        new_sub2.append((s2fn, s2wt, serialize_fields(new_any)))
-                                    else:
-                                        new_sub2.append((s2fn, s2wt, s2val))
-                                except Exception:
-                                    new_sub2.append((s2fn, s2wt, s2val))
-                            else:
-                                new_sub2.append((s2fn, s2wt, s2val))
-                        new_f140.append((sfn, swt, serialize_fields(new_sub2)))
-                    else:
-                        new_f140.append((sfn, swt, sval))
-                new_top.append((fn, wt, serialize_fields(new_f140)))
-            else:
-                new_top.append((fn, wt, val))
+                                    s2val = update_any(s2val)
+                                except ValueError:
+                                    pass
+                            new_sub2.append((s2fn, s2wt, s2val))
+                        sval = serialize_fields(new_sub2)
+                    new_f140.append((sfn, swt, sval))
+                val = serialize_fields(new_f140)
+            new_top.append((fn, wt, val))
         return serialize_fields(new_top), modified
-    except Exception:
+    except ValueError:
         return orig_payload, False
 
 
-def update_transcript_content(content: str, old_str: str, new_str: str) -> str:
-    """Replaces content in transcript log line, handling both substring replacement and formatted code block replacement."""
+def update_transcript_content(content: str, old_str: str, new_str: str, whole_result: bool = False) -> str:
+    """
+    Replaces content in a transcript line. With whole_result, new_str replaces the entire result, whatever old_str
+    holds, keeping the timestamps and file view layout around it. Otherwise only old_str is replaced, if present.
+    """
+    if not whole_result:
+        numbered = replace_in_numbered_text(content, old_str, new_str) if old_str else None
+        if numbered is not None:
+            return numbered
+        if old_str and old_str in content:
+            return content.replace(old_str, new_str)
+        if old_str and old_str.strip() in content:
+            return content.replace(old_str.strip(), (new_str or "").strip())
+        return content
+
+    parts = split_numbered_text(content)
+    if parts:
+        return join_numbered_text(parts[0], parts[1], new_str, parts[3])
     if old_str and old_str in content:
         return content.replace(old_str, new_str)
-
-    if "Tool is running as a background task" in content:
-        m_created = re.search(r"Created At: ([^\n]+)", content)
-        created_str = m_created.group(1) if m_created else datetime.now(timezone.utc).isoformat()
-        m_comp = re.search(r"Completed At: ([^\n]+)", content)
-        comp_str = m_comp.group(1) if m_comp else created_str
-        return f"Created At: {created_str}\nCompleted At: {comp_str}\n\n{new_str.strip()}\n"
-
-    marker = "The following code has been modified to include a line number before every line, in the format: <line_number>: <original_line>. Please note that any changes targeting the original code should remove the line number, colon, and leading space."
-    if marker in content:
-        header, _ = content.split(marker, 1)
-        new_lines = new_str.split("\n")
-        formatted = [f"{i+1}: {line}" for i, line in enumerate(new_lines)]
-        return header + marker + "\n" + "\n".join(formatted) + "\n"
-
     if old_str and old_str.strip() in content:
         return content.replace(old_str.strip(), (new_str or "").strip())
-
-    return content.replace(old_str, new_str) if old_str else new_str
+    header = re.match(r"Created At: [^\n]*\n(?:Completed At: [^\n]*\n)?\n*", content)
+    return (header.group(0) if header else "") + new_str
 
 
 READ_TOOLS = {"view_file", "read_file", "list_dir", "list_directory", "grep_search", "find_by_name"}
@@ -2619,10 +2755,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                 except Exception:
                     pass
 
-            if err_text:
-                new_str = f"The command exited with code {err_code}.\nOutput:\n{err_text.strip()}"
-            else:
-                new_str = f"The command exited with code {err_code}."
+            new_str = command_result_text(read_field(orig_payload, (140, 2, 1)), err_code, err_text).strip()
             err_detail = f"exit code {err_code}" + (f": {err_text.strip()}" if err_text else "")
         else:
             target_url = extract_url_from_step(source_base_dir or base_dir, src_cid, target_step, result_step, orig_payload)
@@ -2662,7 +2795,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         conn.close()
         raise ValueError(f"The replacement text is empty, so step {result_step} would not change. Nothing was changed.")
 
-    # If old_str was not specified and we have new_str to substitute into payload:
+    # Without a search text, the new text replaces the whole result
+    whole_result = not replace_old
     count = 0
     new_payload = orig_payload
     if new_str:
@@ -2701,51 +2835,33 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
             if extracted:
                 old_str = extracted
-            else:
+
+        if tool_name in COMMAND_TOOLS and simulate_error is not None:
+            has_f148 = False
+            try:
+                has_f148 = any(fn == 148 for fn, wt, val in parse_fields(orig_payload))
+            except Exception:
+                pass
+            new_payload, proto_mod = update_command_result_payload(
+                orig_payload,
+                exit_code=err_code,
+                error_output=err_text if err_text is not None else "",
+                strip_background=bool(bg_task_id) or has_f148
+            )
+            if proto_mod:
+                count += 1
+        elif whole_result:
+            new_payload, count = set_result_text(orig_payload, new_str)
+
+        if count == 0:
+            if not old_str:
                 conn.close()
                 raise ValueError(
                     f"Could not automatically detect original observation in step {result_step} payload. Please provide --replace-old."
                 )
-
-        if tool_name in COMMAND_TOOLS:
-            if simulate_error is not None:
-                has_f148 = False
-                try:
-                    has_f148 = any(fn == 148 for fn, wt, val in parse_fields(orig_payload))
-                except Exception:
-                    pass
-                new_payload, proto_mod = update_command_result_payload(
-                    orig_payload,
-                    exit_code=err_code,
-                    error_output=err_text if err_text is not None else "",
-                    strip_background=bool(bg_task_id) or has_f148
-                )
-                if proto_mod:
-                    count += 1
-            elif old_str and new_str:
-                new_payload, proto_mod = update_command_result_payload(
-                    orig_payload,
-                    old_output=old_str,
-                    new_output=new_str
-                )
-                if proto_mod:
-                    count += 1
-
-        if count == 0:
-            old_bytes = old_str.encode("utf-8")
-            new_bytes = new_str.encode("utf-8")
-            new_payload, count = replace_in_bytes(orig_payload, old_bytes, new_bytes)
-            if count == 0 and old_str:
-                old_stripped = old_str.strip()
-                if old_stripped.encode("utf-8") in orig_payload:
-                    new_payload, count = replace_in_bytes(orig_payload, old_stripped.encode("utf-8"), (new_str or "").strip().encode("utf-8"))
-            # Falling back to the whole result is only right when the user named no text to search for
-            if count == 0 and not replace_old:
-                f140 = find_field_140_2(orig_payload)
-                if f140 and f140.encode("utf-8") in orig_payload:
-                    new_payload, count = replace_in_bytes(orig_payload, f140.encode("utf-8"), (new_str or "").strip().encode("utf-8"))
-                elif f140 and f140.strip().encode("utf-8") in orig_payload:
-                    new_payload, count = replace_in_bytes(orig_payload, f140.strip().encode("utf-8"), (new_str or "").strip().encode("utf-8"))
+            new_payload, count = replace_in_result(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8"))
+            if count == 0:
+                new_payload, count = replace_in_result(orig_payload, old_str.strip().encode("utf-8"), new_str.strip().encode("utf-8"))
 
         if tool_name in INQUIRY_TOOLS and inquiry_questions and inquiry_resolved_selections:
             new_payload, entry_count = update_inquiry_entries(new_payload, inquiry_questions, inquiry_resolved_selections)
@@ -2820,10 +2936,10 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     inspect_steps_dir = os.path.join(src_dir, "brain", src_cid, ".system_generated", "steps")
 
     if dry_run:
-        tf_del = modify_or_truncate_jsonl(inspect_tf_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        tc_del = modify_or_truncate_jsonl(inspect_tc_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        cf_del_lines, cf_del_files = modify_or_truncate_chunks(inspect_chunks_full, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        cc_del_lines, cc_del_files = modify_or_truncate_chunks(inspect_chunks_comp, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
+        tf_del = modify_or_truncate_jsonl(inspect_tf_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
+        tc_del = modify_or_truncate_jsonl(inspect_tc_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
+        cf_del_lines, cf_del_files = modify_or_truncate_chunks(inspect_chunks_full, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
+        cc_del_lines, cc_del_files = modify_or_truncate_chunks(inspect_chunks_comp, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
         hist_del = count_or_filter_history(inspect_history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=True)
         st_del, st_mod, st_rem_files = sync_or_prune_step_dirs(
             inspect_steps_dir,
@@ -2911,12 +3027,12 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         s_conn.close()
 
     # 3. Modify and truncate transcripts
-    tf_removed = modify_or_truncate_jsonl(transcript_full_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
-    tc_removed = modify_or_truncate_jsonl(transcript_compact_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    tf_removed = modify_or_truncate_jsonl(transcript_full_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
+    tc_removed = modify_or_truncate_jsonl(transcript_compact_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
 
     # 4. Modify and truncate chunk files
-    cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
-    cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
+    cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
 
     # 5. Filter history.jsonl
     hist_removed = count_or_filter_history(history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=False)
@@ -4090,7 +4206,12 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                             extracted = m.group(1)
                 old_str = extracted or ""
 
-        new_payload, count = replace_in_bytes(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8")) if old_str else (orig_payload, 0)
+        count = 0
+        new_payload = orig_payload
+        if changes_text and not replace_old:
+            new_payload, count = set_result_text(orig_payload, new_str)
+        if count == 0 and old_str:
+            new_payload, count = replace_in_result(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8"))
         # With no replacement requested, such as a log option alone, there is nothing to apply
         if count == 0 and (replace_old or new_str):
             conn.close()

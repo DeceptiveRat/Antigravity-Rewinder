@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
-from rewinding.Antigravity_Rewind import count_or_truncate_chunks, detect_step_info
+from rewinding.Antigravity_Rewind import count_or_truncate_chunks, detect_step_info, replace_in_result
 from test_forks import (
     CHILD,
     CONV,
@@ -233,3 +233,287 @@ def test_damaged_chunk_bytes_are_kept_rather_than_crashing(tmp_path, damage):
 
     expected = good.encode() + (b"" if not damage.strip() else damage + b"\n")
     assert (folder / "00000000.jsonl").read_bytes() == expected
+
+
+# ---------------------------------------------------------------------------
+# Replacements change the result's text in every real format, and nothing else
+# ---------------------------------------------------------------------------
+
+METADATA = bytes_field(5, (
+    bytes_field(4, bytes_field(3, b"a note about 1 and the original text"))
+    + bytes_field(12, b"aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa")
+    + bytes_field(20, bytes_field(1, b"bbbbbbbb-1111-1111-1111-bbbbbbbbbbbb") + bytes_field(4, CONV.encode()))
+))
+ARGUMENTS = bytes_field(1, bytes_field(1, b"CommandLine") + bytes_field(2, b"cat original 1"))
+LABELS = bytes_field(5, b"run 1") + bytes_field(6, b"original") + bytes_field(9, bytes_field(1, b"original 1"))
+WRAPPED_TYPE = b"type.googleapis.com/gemini_coder.Step"
+OUTPUT_PATH = bytes_field(7, f"/brain/{CONV}/steps/1/output.txt".encode())
+ID_IN_TEXT_FIELD = bytes_field(2, bytes_field(1, b"key") + bytes_field(2, b"cccccccc-1111-1111-1111-cccccccccccc"))
+NUMBER_NOTE = (
+    "The following code has been modified to include a line number before every line, in the format: "
+    "<line_number>: <original_line>. Please note that any changes targeting the original code should remove "
+    "the line number, colon, and leading space."
+)
+VIEW_HEAD = f"File Path: `/tmp/original.txt`\nTotal Lines: 12\nShowing lines 10 to 11\n{NUMBER_NOTE}\n"
+VIEW_TAIL = "The above content does NOT show the entire file contents."
+
+
+def result_step(observation: bytes, outside: bytes = b"") -> bytes:
+    """A real result: the type and status, metadata, then the call's arguments and the observation in field 140."""
+    return int_field(1, 132) + int_field(4, 3) + METADATA + outside + bytes_field(140, ARGUMENTS + bytes_field(2, observation))
+
+
+def wrapped(inner: bytes) -> bytes:
+    """A wrapped copy of the step, with its own metadata."""
+    return bytes_field(6, bytes_field(1, WRAPPED_TYPE) + bytes_field(2, METADATA + inner))
+
+
+def command_record(code: int, output: str) -> bytes:
+    """The record in the newest sessions: 1 command, 2 working folder, 3 exit code, 4 output."""
+    record = bytes_field(1, b"cat original 1") + bytes_field(2, b"/tmp/original") + int_field(3, code) + bytes_field(4, output.encode())
+    return bytes_field(3, LABELS + bytes_field(10, bytes_field(3, record)))
+
+
+def older_command_record(output: str) -> bytes:
+    return wrapped(bytes_field(28, bytes_field(21, bytes_field(1, output.encode()))))
+
+
+def shape_plain(text: str) -> bytes:
+    return result_step(bytes_field(1, text.encode()) + OUTPUT_PATH)
+
+
+def shape_newest_command(text: str) -> bytes:
+    return result_step(bytes_field(1, text.encode()) + command_record(0, text) + OUTPUT_PATH)
+
+
+def shape_record_only(text: str) -> bytes:
+    return result_step(command_record(0, text))
+
+
+def shape_older_command(text: str) -> bytes:
+    return result_step(bytes_field(1, text.encode()) + older_command_record(text) + OUTPUT_PATH)
+
+
+def shape_search(text: str) -> bytes:
+    return result_step(bytes_field(1, text.encode()) + wrapped(bytes_field(42, bytes_field(5, text.encode()))))
+
+
+RESULT_SHAPES = [
+    pytest.param(shape_plain, id="text-only"),
+    pytest.param(shape_newest_command, id="newest-command"),
+    pytest.param(shape_record_only, id="record-only"),
+    pytest.param(shape_older_command, id="older-command"),
+    pytest.param(shape_search, id="search"),
+]
+TOOL_STEPS = [pytest.param(1, 2, id="read"), pytest.param(3, 4, id="command"), pytest.param(5, 6, id="write")]
+TIMESTAMPS = "Created At: 2026-10-19T05:10:00Z\nCompleted At: 2026-10-19T05:10:01Z\n\n"
+
+
+def transcript_files(base: Path, conv_id: str = CONV) -> list[Path]:
+    logs = base / "brain" / conv_id / ".system_generated" / "logs"
+    return [logs / "transcript_full.jsonl", logs / "transcript.jsonl", *sorted((logs / "chunks").glob("*/*.jsonl"))]
+
+
+def store_result(base: Path, step: int, payload: bytes, shown_text: str, output_file: str | None = None) -> None:
+    """Stores a result, with the text transcripts show for it, and optionally its output file."""
+    set_step_payload(base, CONV, step, payload)
+    for path in transcript_files(base):
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for record in records:
+            if record["step_index"] == step:
+                record["content"] = shown_text
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    if output_file is not None:
+        folder = base / "brain" / CONV / ".system_generated" / "steps" / str(step)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "output.txt").write_bytes(output_file.encode())
+
+
+def shown_texts(base: Path, step: int, conv_id: str = CONV) -> list[str]:
+    """The result's text in every transcript and chunk file, which all have to agree."""
+    return [
+        record["content"]
+        for path in transcript_files(base, conv_id)
+        for record in map(json.loads, path.read_text(encoding="utf-8").splitlines())
+        if record["step_index"] == step
+    ]
+
+
+def stored_payload(base: Path, step: int, conv_id: str = CONV) -> bytes:
+    with open_db(base / "conversations" / f"{conv_id}.db") as conn:
+        return conn.execute("SELECT step_payload FROM steps WHERE idx = ?", (step,)).fetchone()[0]
+
+
+@pytest.mark.parametrize("call, result", TOOL_STEPS)
+@pytest.mark.parametrize("shape", RESULT_SHAPES)
+def test_whole_replacement_changes_every_copy_of_the_text(base_dir, monkeypatch, call, result, shape):
+    """A result with no 140.2.1 failed outright, and others kept the original in their command record."""
+    store_result(base_dir, result, shape("the original text"), TIMESTAMPS + "the original text", "wrapped: the original text")
+
+    run_cli(monkeypatch, base_dir, str(call), "--replace-text", "NEW TEXT")
+
+    assert stored_payload(base_dir, result) == shape("NEW TEXT")
+    assert shown_texts(base_dir, result) == [TIMESTAMPS + "NEW TEXT"] * 4
+
+
+@pytest.mark.parametrize("shape", RESULT_SHAPES)
+@pytest.mark.parametrize("search, replacement", [("1", "9"), ("original", "CHANGED"), ("text", "t"), ("a", "bbbbbbbbbbbb")])
+def test_search_text_changes_only_the_result_text(base_dir, monkeypatch, shape, search, replacement):
+    """A search for "1" used to rewrite the conversation ID, and the arguments and metadata with it."""
+    text = "value 1 and the original text"
+    store_result(base_dir, 2, shape(text), TIMESTAMPS + text)
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", search, "--replace-new", replacement)
+
+    assert stored_payload(base_dir, 2).count(CONV.encode()) == shape(text).count(CONV.encode())
+    assert stored_payload(base_dir, 2) == shape(text.replace(search, replacement))
+    assert shown_texts(base_dir, 2) == [TIMESTAMPS.replace(search, replacement) + text.replace(search, replacement)] * 4
+
+
+@pytest.mark.parametrize("search", [CONV, "aaaaaaaa-1111", "CommandLine", "a note about", "gemini_coder", "output.txt"])
+def test_text_found_only_outside_the_result_is_reported_as_not_found(base_dir, monkeypatch, capsys, search):
+    store_result(base_dir, 2, shape_plain("the visible text"), TIMESTAMPS + "the visible text")
+    before = snapshot(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, "1", "--replace-old", search, "--replace-new", "CHANGED")
+
+    assert exit_info.value.code == 1
+    assert f"Could not find '{search}' in step 2, so the replacement was not applied. Nothing was changed." in capsys.readouterr().err
+    assert snapshot(base_dir) == before
+
+
+@pytest.mark.parametrize("text", [
+    "\n\nabcdefghij",
+    "\n\x0babc 12345678",
+    "b\x05hello",
+    "\x12\x03abc",
+    "\n",
+    "$" * 36,
+])
+def test_text_that_parses_as_a_message_is_still_treated_as_text(base_dir, monkeypatch, text):
+    """Its length byte used to be recalculated as if it belonged to a nested message, changing a character."""
+    store_result(base_dir, 2, shape_plain(text + " tail"), TIMESTAMPS + text + " tail")
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", "tail", "--replace-new", "longer tail")
+    assert stored_payload(base_dir, 2) == shape_plain(text + " longer tail")
+
+
+@pytest.mark.parametrize("payload", [
+    pytest.param(result_step(LABELS and bytes_field(3, LABELS)), id="labels-but-no-text"),
+    pytest.param(int_field(1, 132) + int_field(4, 3) + METADATA, id="metadata-only"),
+    pytest.param(result_step(b""), id="empty-observation"),
+])
+def test_result_without_stored_text_is_refused_and_keeps_its_structure(base_dir, monkeypatch, capsys, payload):
+    """The first nested message used to be taken for the text, and was replaced by the new text."""
+    store_result(base_dir, 2, payload, TIMESTAMPS + "text only in the transcript")
+    before = snapshot(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, "1", "--replace-text", "NEW TEXT")
+
+    assert exit_info.value.code == 1
+    assert "Could not find 'text only in the transcript' in step 2" in capsys.readouterr().err
+    assert snapshot(base_dir) == before
+
+
+@given(
+    before=st.text(min_size=0, max_size=30),
+    search=st.text(min_size=1, max_size=8),
+    after=st.text(min_size=0, max_size=30),
+    replacement=st.text(min_size=1, max_size=8),
+)
+@settings(max_examples=100, deadline=None)
+def test_replacing_in_a_result_equals_replacing_in_its_text(before, search, after, replacement):
+    """Whatever the text, the step is the same as one built from the replaced text, so no other byte moved."""
+    text = before + search + after
+    new_payload, count = replace_in_result(shape_newest_command(text), search.encode(), replacement.encode())
+    expected = text.replace(search, replacement)
+    assert new_payload == shape_newest_command(expected)
+    assert count == text.count(search) * 2
+
+
+# ---------------------------------------------------------------------------
+# File views number their lines, which a plain search cannot see through
+# ---------------------------------------------------------------------------
+
+def view_text(*lines: str, first: int = 10) -> str:
+    return VIEW_HEAD + "".join(f"{first + i}: {line}\n" for i, line in enumerate(lines)) + VIEW_TAIL
+
+
+def view_shape(text: str, raw: str) -> bytes:
+    return result_step(bytes_field(1, text.encode()) + wrapped(bytes_field(14, bytes_field(4, raw.encode()))))
+
+
+def test_whole_replacement_of_a_file_view_changes_what_the_agent_reads(base_dir, monkeypatch):
+    """Only the raw copy used to change, so the numbered text the agent reads kept the original."""
+    store_result(base_dir, 2, view_shape(view_text("original one", "original two"), "original one\noriginal two"),
+                 TIMESTAMPS + view_text("original one", "original two"))
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-text", "NEW ONE\nNEW TWO\nNEW THREE")
+
+    new_view = view_text("NEW ONE", "NEW TWO", "NEW THREE")
+    assert stored_payload(base_dir, 2) == view_shape(new_view, "NEW ONE\nNEW TWO\nNEW THREE")
+    assert shown_texts(base_dir, 2) == [TIMESTAMPS + new_view] * 4
+
+
+@pytest.mark.parametrize("search, replacement, expected_lines", [
+    ("original one", "CHANGED", ["CHANGED", "original two"]),
+    ("one\noriginal", "A\nB\nC", ["original A", "B", "C two"]),
+    ("original one\noriginal two", "ONE LINE", ["ONE LINE"]),
+])
+def test_search_in_a_file_view_keeps_the_numbering_correct(base_dir, monkeypatch, search, replacement, expected_lines):
+    """Text across lines was not found in the numbered copy, and the transcript was replaced by the search result."""
+    raw = "original one\noriginal two"
+    store_result(base_dir, 2, view_shape(view_text("original one", "original two"), raw), TIMESTAMPS + view_text("original one", "original two"))
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", search, "--replace-new", replacement)
+
+    new_view = view_text(*expected_lines)
+    assert stored_payload(base_dir, 2) == view_shape(new_view, raw.replace(search, replacement))
+    assert shown_texts(base_dir, 2) == [TIMESTAMPS + new_view] * 4
+
+
+# ---------------------------------------------------------------------------
+# Simulated errors follow the format of the session's real results
+# ---------------------------------------------------------------------------
+
+NEW_FORMAT = "Command exited with code 0.\n\nCommand output:\nall good\n"
+OLD_FORMAT = "\nThe command exited with code 0.\nOutput:\nall good\r\n\n"
+
+
+@pytest.mark.parametrize("options, code, output", [
+    (["--simulate-error", "3", "--error-output", "disk full"], 3, "disk full"),
+    (["--simulate-error", "7"], 7, ""),
+    (["--simulate-error"], 1, ""),
+    (["--simulate-error", "2:not found"], 2, "not found"),
+])
+def test_simulated_error_on_the_newest_format(base_dir, monkeypatch, options, code, output):
+    """The record kept exit code 0 and the real output, and the wording differed from every other result."""
+    store_result(base_dir, 4, result_step(bytes_field(1, NEW_FORMAT.encode()) + command_record(0, "all good") + OUTPUT_PATH), TIMESTAMPS + NEW_FORMAT, NEW_FORMAT)
+
+    run_cli(monkeypatch, base_dir, "3", *options)
+
+    first_line = f"Command exited with code {code}."
+    text = f"{first_line}\n\nCommand output:\n{output}\n" if output else f"{first_line}\n"
+    assert stored_payload(base_dir, 4) == result_step(bytes_field(1, text.encode()) + command_record(code, output) + OUTPUT_PATH)
+    assert shown_texts(base_dir, 4) == [TIMESTAMPS + text.strip()] * 4
+
+
+def test_simulated_error_when_only_the_record_holds_the_output(base_dir, monkeypatch):
+    """This format had no text field to rewrite, so the command stopped with an error."""
+    store_result(base_dir, 4, result_step(command_record(0, "all good")), TIMESTAMPS + NEW_FORMAT, NEW_FORMAT)
+
+    run_cli(monkeypatch, base_dir, "3", "--simulate-error", "3", "--error-output", "disk full")
+
+    assert stored_payload(base_dir, 4) == result_step(command_record(3, "disk full"))
+
+
+def test_simulated_error_keeps_the_older_format(base_dir, monkeypatch):
+    original = result_step(bytes_field(1, OLD_FORMAT.encode()) + older_command_record("all good\r\n") + OUTPUT_PATH)
+    store_result(base_dir, 4, original, TIMESTAMPS + OLD_FORMAT, OLD_FORMAT)
+
+    run_cli(monkeypatch, base_dir, "3", "--simulate-error", "3", "--error-output", "disk full")
+
+    new_text = "\nThe command exited with code 3.\nOutput:\ndisk full\r\n\n"
+    record = wrapped(bytes_field(28, bytes_field(21, bytes_field(1, b"disk full\r\n")) + int_field(6, 3) + int_field(11, 1)))
+    assert stored_payload(base_dir, 4) == result_step(bytes_field(1, new_text.encode()) + record + OUTPUT_PATH)
