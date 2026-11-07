@@ -1055,6 +1055,29 @@ def prune_orphan_read_json(messages_dir: str) -> int:
     return 0
 
 
+def purge_messages_after_cut(messages_dir: str, cutoff_ms: int | None, keep_file: str | None = None) -> int:
+    """
+    Removes message files written at or after the cut, and returns how many. read.json only records which messages
+    were read, so it stays, losing the entries of messages that were removed.
+    """
+    if not os.path.isdir(messages_dir) or cutoff_ms is None:
+        return 0
+    removed = 0
+    for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
+        if os.path.basename(m_path) == "read.json":
+            continue
+        if keep_file and os.path.abspath(m_path) == os.path.abspath(keep_file):
+            continue
+        try:
+            if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
+                os.remove(m_path)
+                removed += 1
+        except OSError:
+            pass
+    prune_orphan_read_json(messages_dir)
+    return removed
+
+
 def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
     """Decodes a protobuf varint starting at offset."""
     res = 0
@@ -2537,16 +2560,7 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
             pass
 
     # 7. Remove system messages generated at or after cutoff
-    messages_removed = 0
-    if os.path.isdir(messages_dir) and cutoff_ms is not None:
-        for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-            try:
-                if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                    os.remove(m_path)
-                    messages_removed += 1
-            except OSError:
-                pass
-        prune_orphan_read_json(messages_dir)
+    messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
 
     # 8. Prune post-rewind step output artifact directories
     steps_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, dry_run=False)
@@ -3071,16 +3085,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             pass
 
     # 7. Remove system messages generated at or after cutoff
-    messages_removed = 0
-    if os.path.isdir(messages_dir) and cutoff_ms is not None:
-        for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-            try:
-                if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                    os.remove(m_path)
-                    messages_removed += 1
-            except OSError:
-                pass
-        prune_orphan_read_json(messages_dir)
+    messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
 
     # 8. Synchronize and prune step output artifacts
     st_purged, st_updated, st_removed_files = sync_or_prune_step_dirs(
@@ -4355,16 +4360,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             except OSError:
                 pass
 
-        messages_removed = 0
-        if os.path.isdir(messages_dir) and cutoff_ms is not None:
-            for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-                try:
-                    if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                        os.remove(m_path)
-                        messages_removed += 1
-                except OSError:
-                    pass
-            prune_orphan_read_json(messages_dir)
+        messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
 
         st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=result_step, old_str=old_str, new_str=new_str,
                                                   dry_run=False, whole_result=(changes_text and not replace_old))
@@ -4726,18 +4722,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             except OSError:
                 pass
 
-        messages_removed = 0
-        if os.path.isdir(messages_dir) and cutoff_ms is not None:
-            for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-                if matched_msg_file and os.path.abspath(m_path) == os.path.abspath(matched_msg_file):
-                    continue
-                try:
-                    if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                        os.remove(m_path)
-                        messages_removed += 1
-                except OSError:
-                    pass
-            prune_orphan_read_json(messages_dir)
+        messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms, keep_file=matched_msg_file)
 
         # Passing modify_step keeps the selected step's own folder, which is otherwise treated as discarded
         st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=cutoff_step, dry_run=False)

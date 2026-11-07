@@ -6,6 +6,7 @@ files and databases a command leaves behind.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1387,3 +1388,51 @@ def test_fork_still_drops_a_subagent_it_does_not_need_and_cannot_copy(base_dir, 
     run_cli(monkeypatch, base_dir, "1", "--replace-text", "NEW TEXT", "--fork", "b")
 
     assert len(lineage(base_dir)) == 1
+
+
+# ---------------------------------------------------------------------------
+# The record of which messages were read survives a rewind
+# ---------------------------------------------------------------------------
+
+ROUTES_THAT_CUT = [
+    pytest.param(["19"], id="rewind"),
+    pytest.param(["16"], id="rewind-before-reply"),
+    pytest.param(["1", "--replace-text", "NEW"], id="tool"),
+    pytest.param(["11", "--replace-text", "NEW"], id="manage-task"),
+    pytest.param(["17", "--replace-text", "NEW"], id="task-notification"),
+    pytest.param(["15", "--subagent-exit", "keep-alive", "--replace-text", "NEW"], id="report"),
+]
+OLD_MESSAGE = "99999999-0000-0000-0000-000000000001"
+NEW_MESSAGE = "99999999-0000-0000-0000-000000000002"
+
+
+def add_read_record(base: Path) -> Path:
+    """An old message, a message from after the cut, and the record that both were read, which is always recent."""
+    old = write_message_file(base, OLD_MESSAGE, "system")
+    write_message_file(base, NEW_MESSAGE, "system")
+    os.utime(old, (1000, 1000))
+    record = old.parent / "read.json"
+    record.write_text(json.dumps({OLD_MESSAGE: True, NEW_MESSAGE: True}), encoding="utf-8")
+    return record
+
+
+@pytest.mark.parametrize("args", ROUTES_THAT_CUT)
+def test_rewind_keeps_the_record_of_read_messages(base_dir, monkeypatch, args):
+    """It was deleted as a recent file, so old messages would look unread on resume."""
+    record = add_read_record(base_dir)
+
+    run_cli(monkeypatch, base_dir, *args)
+
+    assert json.loads(record.read_text(encoding="utf-8")) == {OLD_MESSAGE: True}
+    assert (record.parent / f"{OLD_MESSAGE}.json").exists()
+    assert not (record.parent / f"{NEW_MESSAGE}.json").exists()
+
+
+@pytest.mark.parametrize("damage", ["", "not json", "[]", "\x00"])
+def test_damaged_read_record_is_left_alone(base_dir, monkeypatch, damage):
+    record = add_read_record(base_dir)
+    record.write_text(damage, encoding="utf-8")
+
+    run_cli(monkeypatch, base_dir, "19")
+
+    assert record.read_text(encoding="utf-8") == damage
