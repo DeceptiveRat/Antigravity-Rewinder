@@ -1540,3 +1540,32 @@ def test_fork_before_the_spawn_keeps_the_originals_record(base_dir, monkeypatch)
     fork_id = lineage(base_dir)[0][0]
     assert path.read_text(encoding="utf-8") == expected
     assert not (base_dir / "brain" / fork_id / ".system_generated" / "subagents" / f"{CHILD}.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# --replace-web-content leaves the rest of the record intact
+# ---------------------------------------------------------------------------
+
+WEB_NOTE = "  - Note: the stored result was not changed, so the agent may still read the original page. Use --replace-text to change it."
+
+
+def test_web_content_replacement_does_not_blank_the_transcript(base_dir, monkeypatch, capsys):
+    """With no text to replace, the empty value was written over the result in every transcript."""
+    store_result(base_dir, 8, shape_plain("ORIGINAL PAGE"), TIMESTAMPS + "ORIGINAL PAGE")
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE")
+
+    assert shown_texts(base_dir, 8) == [TIMESTAMPS + "ORIGINAL PAGE"] * 4
+    folder = base_dir / "brain" / CONV / ".system_generated" / "steps" / "8"
+    assert (folder / "content.md").read_text(encoding="utf-8") == "NEW PAGE"
+    assert WEB_NOTE in capsys.readouterr().out.splitlines()
+
+
+def test_web_content_note_is_absent_when_the_result_also_changes(base_dir, monkeypatch, capsys):
+    store_result(base_dir, 8, shape_plain("ORIGINAL PAGE"), TIMESTAMPS + "ORIGINAL PAGE")
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE", "--replace-text", "NEW RESULT")
+
+    assert stored_payload(base_dir, 8) == shape_plain("NEW RESULT")
+    assert shown_texts(base_dir, 8) == [TIMESTAMPS + "NEW RESULT"] * 4
+    assert WEB_NOTE not in capsys.readouterr().out.splitlines()

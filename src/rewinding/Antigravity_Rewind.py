@@ -896,8 +896,10 @@ def modify_or_truncate_lines(lines, cutoff_step: int, modify_step: int = None, o
                 removed += 1
                 continue
             if idx is not None and idx == modify_step and not dry_run:
-                content = data.get("content", "")
-                data["content"] = update_transcript_content(content, old_str, new_str or "", whole_result)
+                # With no text change, such as a web page replaced in content.md only, the result stays as it is
+                if old_str is not None or new_str is not None:
+                    content = data.get("content", "")
+                    data["content"] = update_transcript_content(content, old_str, new_str or "", whole_result)
                 if data.get("status") == "RUNNING":
                     data["status"] = "DONE"
                 if "completed_at" not in data or not data.get("completed_at"):
@@ -2143,6 +2145,9 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
       - if delete_web_content is True, removes steps/<modify_step>/content.md.
     Returns (purged_dirs_count, modified_files_count, deleted_files_count).
     """
+    # A replaced web page has to be written, or the command would report a change it never made
+    if steps_dir and new_web_content is not None and not dry_run:
+        os.makedirs(steps_dir, exist_ok=True)
     if not steps_dir or not os.path.isdir(steps_dir):
         return 0, 0, 0
 
@@ -3167,6 +3172,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         print(f"  - Cleaned background task artifacts for '{bg_task_id}' (converted to synchronous result).")
     if web_content_text is not None:
         print(f"  - Updated web content artifact: steps/{result_step}/content.md ({len(web_content_text)} bytes).")
+        if not new_str:
+            print("  - Note: the stored result was not changed, so the agent may still read the original page. Use --replace-text to change it.")
     print(f"  - Deleted {steps_to_delete} downstream step(s) from 'steps' table.")
     print(f"  - Remaining steps count: {remaining_steps} (steps 0 to {last_result_step}).")
     print(f"  - Truncated {tf_removed} line(s) from transcript_full.jsonl and {tc_removed} line(s) from transcript.jsonl.")
