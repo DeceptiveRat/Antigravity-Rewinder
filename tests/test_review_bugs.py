@@ -30,6 +30,7 @@ from test_forks import (
     error_box,
     int_field,
     open_db,
+    open_tui,
     run_cli,
     run_real_tui,
     snapshot,
@@ -1050,3 +1051,60 @@ def test_every_multi_select_choice_is_kept_in_mapped_form(selection):
     """Metamorphic check: the mapped and plain forms name the same options."""
     plain = ",".join(selection)
     assert build_inquiry_answer(ONE_QUESTION, choice_spec=f"1={plain}")[0] == build_inquiry_answer(ONE_QUESTION, choice_spec=plain)[0]
+
+
+# ---------------------------------------------------------------------------
+# The TUI's rewind keys follow the same rules as the command line
+# ---------------------------------------------------------------------------
+
+def press(monkeypatch, base: Path, cursor: int, key: str):
+    app, _, confirms = open_tui(monkeypatch, base, cursor, clear_logs=True)
+    app.handle_input_char(ord(key))
+    return app, confirms
+
+
+@pytest.mark.parametrize("key, step, message", [
+    ("r", 2, "Cannot rewind to a tool result; select the tool call at step 1."),
+    ("b", 2, "Cannot rewind to a tool result; select the tool call at step 1."),
+    ("r", 15, "Cannot rewind to step 15: subagent_report steps cannot be rewound to."),
+    ("b", 15, "Cannot rewind to step 15: subagent_report steps cannot be rewound to."),
+    ("r", 17, "Cannot rewind to step 17: task_notification steps cannot be rewound to."),
+    ("r", 18, "Cannot rewind to step 18: system_message steps cannot be rewound to."),
+    ("b", 18, "Cannot rewind to step 18: system_message steps cannot be rewound to."),
+    ("b", 0, "Cannot rewind before a response at step 0: it is a prompt. Use R to remove it."),
+    ("b", 19, "Cannot rewind before a response at step 19: it is a prompt. Use R to remove it."),
+])
+def test_rewind_keys_refuse_steps_the_command_line_refuses(base_dir, monkeypatch, key, step, message):
+    """R left a tool call with no result, and B deleted a prompt and marked the session as running."""
+    before = snapshot(base_dir)
+
+    app, confirms = press(monkeypatch, base_dir, step, key)
+
+    assert app.status_msg == message
+    assert confirms == []
+    assert snapshot(base_dir) == before
+
+
+@pytest.mark.parametrize("key, step, status", [
+    ("r", 0, "Rewound to step 0 successfully."),
+    ("r", 19, "Rewound to step 19 successfully."),
+    ("r", 16, "Rewound to step 16 successfully."),
+    ("r", 1, "Rewound to step 1 successfully."),
+    ("b", 16, "Rewound before response successfully."),
+    ("b", 1, "Rewound before response successfully."),
+    ("b", 13, "Rewound before response successfully."),
+])
+def test_rewind_keys_still_work_where_the_command_line_allows(base_dir, monkeypatch, key, step, status):
+    app, _ = press(monkeypatch, base_dir, step, key)
+
+    assert app.status_msg == status
+    with open_db(base_dir / "conversations" / f"{CONV}.db") as conn:
+        assert [row[0] for row in conn.execute("SELECT idx FROM steps ORDER BY idx")] == list(range(step))
+
+
+def test_rewind_action_refuses_without_a_dialog_too(base_dir, monkeypatch):
+    app, _, _ = open_tui(monkeypatch, base_dir, 2)
+    before = snapshot(base_dir)
+
+    assert app.execute_action_rewind(clear_task_logs=True) == (False, "Cannot rewind to a tool result; select the tool call at step 1.")
+    assert snapshot(base_dir) == before

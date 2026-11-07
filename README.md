@@ -52,8 +52,8 @@ python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> 
 ```
 - Up/Down or j/k: Scrub between historical steps
 - PageUp/PageDown: Scroll right-hand inspector view
-- B: Rewind before response (keeps the prior context, in place)
-- R: Rewind to the selected step (deletes it and everything after it, in place)
+- B: Rewind before a response or tool call (keeps the prior context, in place)
+- R: Rewind to a prompt, response or tool call (deletes it and everything after it, in place)
 - I: Intervene on a tool call or task notification (asks for the text to find and its replacement, in place)
 - F: Fork at the selected step, leaving the original untouched. On tool calls, task notifications, and subagent reports it asks for text that replaces the whole result
 - D: Toggle dry-run mode, where a popup shows what would change
