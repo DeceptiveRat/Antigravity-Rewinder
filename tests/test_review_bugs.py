@@ -728,3 +728,70 @@ def test_notification_without_stored_text_is_still_written(base_dir, monkeypatch
     message_id, sender, text = extract_subagent_msg_info(stored_payload(base_dir, 17))
     assert (sender, text) == (f"{CONV}/task-4", "NEW MESSAGE")
     assert message_id is not None
+
+
+# ---------------------------------------------------------------------------
+# Output files only change when the result's text is really in them
+# ---------------------------------------------------------------------------
+
+def output_file(base: Path, step: int) -> Path:
+    return base / "brain" / CONV / ".system_generated" / "steps" / str(step) / "output.txt"
+
+
+def test_partial_replacement_does_not_create_an_output_file(base_dir, monkeypatch):
+    """A new output.txt held only the snippet, which a later whole replacement then took for the whole result."""
+    store_result(base_dir, 2, shape_plain("ORIGINAL FILE TEXT"), TIMESTAMPS + "ORIGINAL FILE TEXT")
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", "ORIGINAL", "--replace-new", "CHANGED")
+
+    assert not output_file(base_dir, 2).exists()
+    assert stored_payload(base_dir, 2) == shape_plain("CHANGED FILE TEXT")
+
+
+def test_whole_replacement_after_a_partial_one_leaves_nothing_behind(base_dir, monkeypatch):
+    """The exact sequence from the review, which ended in WHOLE NEW RESULT FILE TEXT."""
+    store_result(base_dir, 2, shape_plain("ORIGINAL FILE TEXT"), TIMESTAMPS + "ORIGINAL FILE TEXT")
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", "ORIGINAL", "--replace-new", "CHANGED")
+    run_cli(monkeypatch, base_dir, "1", "--replace-text", "WHOLE NEW RESULT")
+
+    assert stored_payload(base_dir, 2) == shape_plain("WHOLE NEW RESULT")
+    assert shown_texts(base_dir, 2) == [TIMESTAMPS + "WHOLE NEW RESULT"] * 4
+
+
+@pytest.mark.parametrize("output", ["unrelated output", "", "ORIGINAL only partly", "  \n"])
+def test_partial_replacement_leaves_a_differing_output_file_alone(base_dir, monkeypatch, output):
+    """A file that did not hold the search text was overwritten with only the new snippet."""
+    store_result(base_dir, 2, shape_plain("SEARCHED FILE TEXT"), TIMESTAMPS + "SEARCHED FILE TEXT", output)
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", "SEARCHED", "--replace-new", "CHANGED")
+
+    assert output_file(base_dir, 2).read_bytes() == output.encode()
+
+
+def test_partial_replacement_updates_an_output_file_holding_the_text(base_dir, monkeypatch):
+    store_result(base_dir, 2, shape_plain("line one\r\nline two\r\n"), TIMESTAMPS + "line one\r\nline two\r\n", "line one\r\nline two\r\n")
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", "two", "--replace-new", "2")
+
+    assert output_file(base_dir, 2).read_bytes() == b"line one\r\nline 2\r\n"
+
+
+@pytest.mark.parametrize("existing", [None, "stale text that differs", ""])
+def test_whole_replacement_writes_the_output_file(base_dir, monkeypatch, existing):
+    store_result(base_dir, 2, shape_plain("ORIGINAL"), TIMESTAMPS + "ORIGINAL", existing)
+    output_file(base_dir, 2).parent.parent.mkdir(parents=True, exist_ok=True)
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-text", "WHOLE NEW RESULT")
+
+    assert output_file(base_dir, 2).read_bytes() == b"WHOLE NEW RESULT"
+
+
+def test_dry_run_counts_only_the_files_it_would_change(base_dir, monkeypatch, capsys):
+    store_result(base_dir, 2, shape_plain("SEARCHED"), TIMESTAMPS + "SEARCHED", "unrelated output")
+    before = snapshot(base_dir)
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-old", "SEARCHED", "--replace-new", "CHANGED", "--dry-run")
+
+    assert "Step artifact files to update" not in capsys.readouterr().out
+    assert snapshot(base_dir) == before

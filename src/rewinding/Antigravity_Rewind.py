@@ -2069,12 +2069,13 @@ def update_inquiry_entries(data: bytes, questions: list[dict], resolved_selectio
 def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int = None,
                             old_str: str = None, new_str: str = None,
                             new_web_content: str = None, delete_web_content: bool = False,
-                            dry_run: bool = False) -> tuple[int, int, int]:
+                            dry_run: bool = False, whole_result: bool = False) -> tuple[int, int, int]:
     """
     Prunes step artifact directories (brain/<conv_id>/.system_generated/steps/<idx>)
     where idx > cutoff_step (or idx >= cutoff_step if modify_step is None).
     If modify_step is provided:
-      - updates output.txt in steps/<modify_step>/ (or replaces old_str with new_str).
+      - replaces old_str with new_str in output.txt in steps/<modify_step>/, if it holds old_str.
+      - if whole_result is True, new_str replaces the whole of output.txt, creating it if needed.
       - if new_web_content is provided, writes it to steps/<modify_step>/content.md.
       - if delete_web_content is True, removes steps/<modify_step>/content.md.
     Returns (purged_dirs_count, modified_files_count, deleted_files_count).
@@ -2085,6 +2086,7 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
     purged_dirs = 0
     modified_files = 0
     deleted_files = 0
+    whole_result = bool(new_str) and (whole_result or not old_str)
 
     for entry in sorted(os.listdir(steps_dir)):
         dir_path = os.path.join(steps_dir, entry)
@@ -2129,26 +2131,21 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
                 try:
                     with open(out_path, "r", encoding="utf-8", newline="") as f:
                         content = f.read()
-                    if old_str and old_str in content:
+                    new_content = None
+                    if whole_result:
+                        new_content = new_str
+                    elif old_str and old_str in content:
                         new_content = content.replace(old_str, new_str or "")
-                        modified_files += 1
-                        if not dry_run:
-                            with open(out_path, "w", encoding="utf-8", newline="") as f:
-                                f.write(new_content)
-                    elif old_str and old_str.strip() in content:
+                    elif old_str and old_str.strip() and old_str.strip() in content:
                         new_content = content.replace(old_str.strip(), (new_str or "").strip())
+                    if new_content is not None:
                         modified_files += 1
                         if not dry_run:
                             with open(out_path, "w", encoding="utf-8", newline="") as f:
                                 f.write(new_content)
-                    elif new_str:
-                        modified_files += 1
-                        if not dry_run:
-                            with open(out_path, "w", encoding="utf-8", newline="") as f:
-                                f.write(new_str)
                 except Exception:
                     pass
-            elif not os.path.exists(out_path) and new_str:
+            elif whole_result:
                 modified_files += 1
                 if not dry_run:
                     try:
@@ -2167,8 +2164,8 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
                     with open(os.path.join(modify_dir, "content.md"), "w", encoding="utf-8") as f:
                         f.write(new_web_content)
                     modified_files += 1
-                if new_str:
-                    with open(os.path.join(modify_dir, "output.txt"), "w", encoding="utf-8") as f:
+                if whole_result:
+                    with open(os.path.join(modify_dir, "output.txt"), "w", encoding="utf-8", newline="") as f:
                         f.write(new_str)
                     modified_files += 1
             except Exception:
@@ -2965,7 +2962,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             new_str=new_str,
             new_web_content=web_content_text,
             delete_web_content=(simulate_error is not None),
-            dry_run=True
+            dry_run=True,
+            whole_result=whole_result
         )
 
         if source_conv_id:
@@ -3083,7 +3081,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         new_str=new_str,
         new_web_content=web_content_text,
         delete_web_content=(simulate_error is not None and tool_name not in COMMAND_TOOLS),
-        dry_run=False
+        dry_run=False,
+        whole_result=whole_result
     )
 
     # 9. Prune downstream background task logs and clean up converted background task
@@ -4359,7 +4358,8 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                     pass
             prune_orphan_read_json(messages_dir)
 
-        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=result_step, old_str=old_str, new_str=new_str,
+                                                  dry_run=False, whole_result=(changes_text and not replace_old))
         tasks_purged = prune_tasks_dir(tasks_dir, cutoff_step + 1, dry_run=False)
 
         print(f"Successfully executed Intervene Mode on conversation {conv_id} at Step {target_step} ({tool_name}):")
