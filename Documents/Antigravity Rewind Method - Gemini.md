@@ -43,14 +43,14 @@ To understand how rewinding works, mentors need to know that Antigravity does **
 #### Paradigm A: Truncation Rewind (Prompt or Model Response)
 This mode rolls the session back to an earlier timestamp and deletes everything downstream.
 - **Rewind before Prompt (USER_INPUT)**: Deletes the target prompt and all downstream model responses and tool executions. Sets `conversation_summaries.db` status to idle.
-- **Rewind before Model Response (MODEL_RESPONSE or `--before-response`)**: Deletes the model response (and downstream actions), preserving the user prompt and prior tool context. Sets `status = 'CASCADE_RUN_STATUS_RUNNING'` and `not_fully_idle = 1`. When the user resumes with `agy --conversation <id>`, Antigravity sees an active in-flight turn and immediately triggers the LLM to regenerate its decision from the preserved context.
+- **Rewind before Model Response (MODEL_RESPONSE or `--before-response`)**: Deletes the model response (and downstream actions), preserving the user prompt and prior tool context. Sets `status = 'CASCADE_RUN_STATUS_RUNNING'` and `not_fully_idle = 1`. When the user resumes with `agy --conversation <id>`, Antigravity resets the status to idle and waits. The LLM regenerates its decision from the preserved context only once it receives a prompt (tested with agy 1.5.2).
 
 #### Paradigm B: Counterfactual Tool Intervention
 This mode targets a tool call step (e.g. `run_command`, `view_file`, `read_url_content`, `ask_question`, `manage_task`, or subagent reports) to alter the result:
 - It keeps the tool call step.
 - It modifies the tool result (Step `target_step + 1`) to inject synthetic data, user overrides, or simulated errors.
 - It truncates all subsequent downstream steps (Step `target_step + 2` onward).
-- It arms the session to running mode so the LLM resumes reasoning based on the injected counterfactual result.
+- It sets the session to running mode. The LLM resumes reasoning based on the injected counterfactual result once it receives a prompt (tested with agy 1.5.2).
 
 ---
 
@@ -112,7 +112,7 @@ When the rewinding script runs, it executes an atomic, multi-stage synchronizati
      - `status = 'CASCADE_RUN_STATUS_RUNNING'`
      - `not_fully_idle = 1`
      - `raw_summary = NULL`
-   - This signal tells Antigravity upon startup that the session is mid-flight. Instead of waiting for user input, it immediately triggers the LLM orchestrator using the exact prior conversation history remaining in the database.
+   - This marks the session as mid-flight, but Antigravity resets it to idle on startup and waits for input (tested with agy 1.5.2). The LLM orchestrator continues from the exact prior conversation history in the database once it receives a prompt.
 
 6. **State Isolation (`-o / --out-dir`) and Dry-Run (`-n / --dry-run`)**:
    - To preserve forensic integrity, passing `--out-dir` clones the session state into a separate directory tree before applying mutations, leaving the original source `.gemini` directory pristine.
