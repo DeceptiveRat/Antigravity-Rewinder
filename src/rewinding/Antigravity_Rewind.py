@@ -9,9 +9,11 @@ Synchronized with the ACTF pipeline (cli.py) to parse and list all event types
 """
 
 import argparse
+import contextlib
 import glob
 import json
 import os
+import pathlib
 import re
 import shutil
 import sqlite3
@@ -58,6 +60,17 @@ DEFAULT_OUTPUT_DIR = os.path.join(REPO_ROOT, "output")
 CLI_PATH = os.path.join(SRC_DIR, "cli.py")
 
 
+@contextlib.contextmanager
+def open_database(path: str):
+    """Commits on success and always closes. A plain "with sqlite3.connect" commits but leaves the handle open."""
+    conn = sqlite3.connect(path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def resolve_base_dir(target_dir: str) -> str:
     """Finds the antigravity-cli directory."""
     path = os.path.abspath(os.path.expanduser(target_dir))
@@ -67,6 +80,18 @@ def resolve_base_dir(target_dir: str) -> str:
     if os.path.isdir(candidate):
         return candidate
     return path
+
+
+def resume_command(base_dir: str, conv_id: str) -> str:
+    """Builds the resume command. agy finds its data under $HOME/.gemini/antigravity-cli, so HOME is what points it at a session."""
+    base = os.path.abspath(base_dir)
+    layout = os.path.join(".gemini", "antigravity-cli")
+    if not base.endswith(os.sep + layout):
+        return f'Move this folder to <new home>/{layout}, then run: HOME="<new home>" agy --conversation {conv_id}'
+    home = base[:-len(layout) - 1]
+    if home == os.path.expanduser("~"):
+        return f"agy --conversation {conv_id}"
+    return f'HOME="{home}" agy --conversation {conv_id}'
 
 
 def resolve_dest_base_dir(raw_source: str, raw_dest: str) -> str:
@@ -96,7 +121,7 @@ def get_conversation_info(base_dir: str, conv_id: str) -> tuple[int, str]:
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
     if os.path.exists(summary_db_path):
         try:
-            with sqlite3.connect(summary_db_path) as s_conn:
+            with open_database(summary_db_path) as s_conn:
                 s_cur = s_conn.cursor()
                 row = s_cur.execute(
                     "SELECT step_count, title, preview FROM conversation_summaries WHERE conversation_id = ?",
@@ -114,7 +139,7 @@ def get_conversation_info(base_dir: str, conv_id: str) -> tuple[int, str]:
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     if os.path.exists(conv_db_path):
         try:
-            with sqlite3.connect(conv_db_path) as c_conn:
+            with open_database(conv_db_path) as c_conn:
                 c_cur = c_conn.cursor()
                 db_count = c_cur.execute("SELECT COUNT(*) FROM steps").fetchone()[0]
                 if step_count is None or db_count != 0:
@@ -631,13 +656,11 @@ def show_step(base_dir: str, conv_id: str, target_step: int):
     row_target = None
     if os.path.exists(conv_db_path):
         try:
-            conn = sqlite3.connect(conv_db_path)
-            cur = conn.cursor()
-            row_target = cur.execute(
-                "SELECT idx, step_type, status, metadata, step_payload FROM steps WHERE idx = ?",
-                (target_step,)
-            ).fetchone()
-            conn.close()
+            with open_database(conv_db_path) as conn:
+                row_target = conn.execute(
+                    "SELECT idx, step_type, status, metadata, step_payload FROM steps WHERE idx = ?",
+                    (target_step,)
+                ).fetchone()
         except Exception:
             pass
 
@@ -1286,7 +1309,8 @@ def update_command_result_payload(
                                                     if not has_f21 and error_output:
                                                         new_cmd.append((21, 2, out_bytes))
                                                 new_st.append((st_fn, st_wt, serialize_fields(new_cmd)))
-                                                modified = True
+                                                if exit_code is not None:
+                                                    modified = True
                                             else:
                                                 new_st.append((st_fn, st_wt, st_val))
                                         new_any = [(1, 2, type_url), (2, 2, serialize_fields(new_st))]
@@ -1333,7 +1357,7 @@ def update_transcript_content(content: str, old_str: str, new_str: str) -> str:
     return content.replace(old_str, new_str) if old_str else new_str
 
 
-READ_TOOLS = {"view_file", "read_file", "list_directory", "grep_search", "find_by_name"}
+READ_TOOLS = {"view_file", "read_file", "list_dir", "list_directory", "grep_search", "find_by_name"}
 COMMAND_TOOLS = {"run_command", "send_command_input"}
 WRITE_TOOLS = {"write_to_file", "write_file", "replace_file_content", "edit_file"}
 WEB_TOOLS = {"search_web", "read_url_content"}
@@ -1473,11 +1497,27 @@ def find_future_task_logs(base_dir: str, conv_id: str, target_step: int, categor
     Lists background tasks whose logs hold output from steps that acting on target_step discards.
     Tool calls keep their result step, so their cutoff is one step later.
     """
-    # A simulated command error turns a background launch into a finished synchronous result
+    if "tool_call" not in category:
+        return find_downstream_task_completions(base_dir, conv_id, target_step)
+
+    result_step = target_step + 1
+    cutoff_step = result_step
+    payload = None
+    db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
+    transcript = os.path.join(base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+    if os.path.exists(db_path):
+        with open_database(db_path) as conn:
+            cutoff_step = find_last_result_step(conn.cursor(), transcript, target_step)
+            row = conn.execute("SELECT step_payload FROM steps WHERE idx = ?", (result_step,)).fetchone()
+            payload = row[0] if row else None
+    future_tasks = find_downstream_task_completions(base_dir, conv_id, cutoff_step)
+
+    # A simulated command error means the command's own background task never ran, so its log
+    # is removed outright and needs no decision. Other tasks' logs still do.
     if category == "tool_call_command" and simulate_error is not None:
-        return []
-    cutoff_step = target_step + 1 if "tool_call" in category else target_step
-    return find_downstream_task_completions(base_dir, conv_id, cutoff_step)
+        own_task = find_launched_task(transcript, result_step, payload)
+        future_tasks = [task for task in future_tasks if task[0] != own_task]
+    return future_tasks
 
 
 def find_unresolved_task_logs(future_tasks: list[tuple[str, int, int]], task_output: str | list[str] | None,
@@ -1650,7 +1690,7 @@ def extract_inquiry_questions(base_dir: str, conv_id: str, target_step: int, pay
         conv_db = os.path.join(base_dir, "conversations", f"{conv_id}.db")
         if os.path.exists(conv_db):
             try:
-                with sqlite3.connect(conv_db) as conn:
+                with open_database(conv_db) as conn:
                     cur = conn.cursor()
                     row = cur.execute("SELECT step_payload FROM steps WHERE idx = ?", (target_step,)).fetchone()
                     if row and row[0]:
@@ -1917,24 +1957,24 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
             out_path = os.path.join(dir_path, "output.txt")
             if os.path.isfile(out_path):
                 try:
-                    with open(out_path, "r", encoding="utf-8") as f:
+                    with open(out_path, "r", encoding="utf-8", newline="") as f:
                         content = f.read()
                     if old_str and old_str in content:
                         new_content = content.replace(old_str, new_str or "")
                         modified_files += 1
                         if not dry_run:
-                            with open(out_path, "w", encoding="utf-8") as f:
+                            with open(out_path, "w", encoding="utf-8", newline="") as f:
                                 f.write(new_content)
                     elif old_str and old_str.strip() in content:
                         new_content = content.replace(old_str.strip(), (new_str or "").strip())
                         modified_files += 1
                         if not dry_run:
-                            with open(out_path, "w", encoding="utf-8") as f:
+                            with open(out_path, "w", encoding="utf-8", newline="") as f:
                                 f.write(new_content)
                     elif new_str:
                         modified_files += 1
                         if not dry_run:
-                            with open(out_path, "w", encoding="utf-8") as f:
+                            with open(out_path, "w", encoding="utf-8", newline="") as f:
                                 f.write(new_str)
                 except Exception:
                     pass
@@ -1942,7 +1982,7 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
                 modified_files += 1
                 if not dry_run:
                     try:
-                        with open(out_path, "w", encoding="utf-8") as f:
+                        with open(out_path, "w", encoding="utf-8", newline="") as f:
                             f.write(new_str)
                     except Exception:
                         pass
@@ -1986,7 +2026,7 @@ def detect_step_info(base_dir: str, conv_id: str, step_idx: int) -> tuple[str, s
     if not os.path.exists(conv_db_path):
         raise FileNotFoundError(f"Conversation database not found: {conv_db_path}")
 
-    with sqlite3.connect(conv_db_path) as conn:
+    with open_database(conv_db_path) as conn:
         cur = conn.cursor()
         row = cur.execute("SELECT idx, step_type, step_payload FROM steps WHERE idx = ?", (step_idx,)).fetchone()
         if not row:
@@ -2107,7 +2147,7 @@ def detect_step_info(base_dir: str, conv_id: str, step_idx: int) -> tuple[str, s
 
         # Fallback to inspecting payload
         if payload:
-            for rt in [b"view_file", b"read_file", b"list_directory", b"grep_search", b"find_by_name"]:
+            for rt in [b"view_file", b"read_file", b"list_directory", b"list_dir", b"grep_search", b"find_by_name"]:
                 if rt in payload:
                     return ("tool_call_read", rt.decode("utf-8", errors="ignore"))
             for ct in [b"run_command", b"send_command_input"]:
@@ -2359,7 +2399,7 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
         print(f"  - Updated conversation_summaries.db (step_count={remaining_steps}, last_user_input={last_user_input}).")
     print(f"  - Purged protobuf summary cache: jetbox_summaries_proto.pb.")
     print("\nYou can now resume Antigravity with:")
-    print(f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {conv_id}')
+    print(f"  {resume_command(base_dir, conv_id)}")
 
 
 def is_background_launch(payload: bytes | None) -> bool:
@@ -2372,6 +2412,56 @@ def is_background_launch(payload: bytes | None) -> bool:
         return any(fn == 148 for fn, _, _ in parse_fields(payload))
     except ValueError:
         return False
+
+
+def find_last_result_step(cur: sqlite3.Cursor, transcript_path: str, call_step: int) -> int:
+    """
+    Returns the last result step of a tool call step. A step making several calls has one result
+    per call straight after it, and all must survive a cut, or the calls would be left without results.
+    """
+    call_count = 1
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("step_index") == call_step:
+                    call_count = len(record.get("tool_calls") or []) or 1
+                    break
+
+    last_result = call_step + 1
+    for step in range(call_step + 2, call_step + call_count + 1):
+        row = cur.execute("SELECT step_type FROM steps WHERE idx = ?", (step,)).fetchone()
+        if not row or row[0] not in (132, 5):
+            break
+        last_result = step
+    return last_result
+
+
+def find_launched_task(transcript_path: str, result_step: int, payload: bytes | None) -> str | None:
+    """Returns the background task a command result started, or None if the result started none."""
+    if not is_background_launch(payload):
+        return None
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("step_index") == result_step:
+                    match = re.search(r"task-(\d+)", record.get("content", ""))
+                    if match:
+                        return f"task-{match.group(1)}"
+                    break
+    match = re.search(rb"task-(\d+)", payload)
+    return f"task-{match.group(1).decode('utf-8')}" if match else None
 
 
 def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
@@ -2435,30 +2525,14 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # Only a simulated command error means a background task never ran, which makes its log
     # obsolete. Anywhere else, "task-N" in a result is just text.
+    src_tf = transcript_full_path
+    if not os.path.exists(src_tf) and source_base_dir:
+        src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
+    last_result_step = find_last_result_step(cur, src_tf, target_step)
+
     bg_task_id = None
-    if simulate_error is not None and tool_name in COMMAND_TOOLS and is_background_launch(orig_payload):
-        src_tf = transcript_full_path
-        if not os.path.exists(src_tf) and source_base_dir:
-            src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
-        if os.path.exists(src_tf):
-            with open(src_tf, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        d = json.loads(line)
-                        if d.get("step_index") == result_step:
-                            cnt = d.get("content", "")
-                            m_t = re.search(r"task-(\d+)", cnt)
-                            if m_t:
-                                bg_task_id = f"task-{m_t.group(1)}"
-                            break
-                    except Exception:
-                        pass
-        if not bg_task_id:
-            m = re.search(rb"task-(\d+)", orig_payload)
-            if m:
-                bg_task_id = f"task-{m.group(1).decode('utf-8')}"
+    if simulate_error is not None and tool_name in COMMAND_TOOLS:
+        bg_task_id = find_launched_task(src_tf, result_step, orig_payload)
 
     # Determine replacement strings and web content
     old_str = replace_old
@@ -2589,7 +2663,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                 step_out_file = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "steps", str(result_step), "output.txt")
             if os.path.exists(step_out_file):
                 try:
-                    with open(step_out_file, "r", encoding="utf-8") as f:
+                    # newline="" keeps CRLF line endings, or the text would no longer match the stored result
+                    with open(step_out_file, "r", encoding="utf-8", newline="") as f:
                         extracted = f.read()
                 except Exception:
                     pass
@@ -2653,7 +2728,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                 old_stripped = old_str.strip()
                 if old_stripped.encode("utf-8") in orig_payload:
                     new_payload, count = replace_in_bytes(orig_payload, old_stripped.encode("utf-8"), (new_str or "").strip().encode("utf-8"))
-            if count == 0:
+            # Falling back to the whole result is only right when the user named no text to search for
+            if count == 0 and not replace_old:
                 f140 = find_field_140_2(orig_payload)
                 if f140 and f140.encode("utf-8") in orig_payload:
                     new_payload, count = replace_in_bytes(orig_payload, f140.encode("utf-8"), (new_str or "").strip().encode("utf-8"))
@@ -2669,17 +2745,17 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             raise ValueError(f"Could not find '{clean_preview(old_str, 50)}' in step {result_step}, so the replacement was not applied. Nothing was changed.")
 
     # Steps count calculation
-    remaining_steps = cur.execute("SELECT COUNT(*) FROM steps WHERE idx <= ?", (result_step,)).fetchone()[0]
-    steps_to_delete = cur.execute("SELECT COUNT(*) FROM steps WHERE idx > ?", (result_step,)).fetchone()[0]
+    remaining_steps = cur.execute("SELECT COUNT(*) FROM steps WHERE idx <= ?", (last_result_step,)).fetchone()[0]
+    steps_to_delete = cur.execute("SELECT COUNT(*) FROM steps WHERE idx > ?", (last_result_step,)).fetchone()[0]
 
     remaining_model_turns = cur.execute(
         "SELECT COUNT(*) FROM steps WHERE step_type = ? AND idx <= ?",
-        (STEP_TYPE_MODEL_RESPONSE, result_step)
+        (STEP_TYPE_MODEL_RESPONSE, last_result_step)
     ).fetchone()[0]
 
     last_user_input = cur.execute(
         "SELECT MAX(idx) FROM steps WHERE step_type = ? AND idx <= ?",
-        (STEP_TYPE_USER_INPUT, result_step)
+        (STEP_TYPE_USER_INPUT, last_result_step)
     ).fetchone()[0]
     if last_user_input is None:
         last_user_input = -1
@@ -2699,7 +2775,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                 try:
                     data = json.loads(line)
                     idx = data.get("step_index")
-                    if idx is not None and idx > result_step:
+                    if idx is not None and idx > last_result_step:
                         if cutoff_ms is None:
                             created_at = data.get("created_at")
                             if created_at:
@@ -2718,10 +2794,10 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
     parent_refs_to_delete = 0
     if "parent_references" in tables:
-        parent_refs_to_delete = cur.execute("SELECT COUNT(*) FROM parent_references WHERE idx > ?", (result_step,)).fetchone()[0]
+        parent_refs_to_delete = cur.execute("SELECT COUNT(*) FROM parent_references WHERE idx > ?", (last_result_step,)).fetchone()[0]
     battle_infos_to_delete = 0
     if "battle_mode_infos" in tables:
-        battle_infos_to_delete = cur.execute("SELECT COUNT(*) FROM battle_mode_infos WHERE idx > ?", (result_step,)).fetchone()[0]
+        battle_infos_to_delete = cur.execute("SELECT COUNT(*) FROM battle_mode_infos WHERE idx > ?", (last_result_step,)).fetchone()[0]
 
     # Dry run paths
     src_dir = source_base_dir if (dry_run and source_base_dir) else base_dir
@@ -2733,14 +2809,14 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     inspect_steps_dir = os.path.join(src_dir, "brain", src_cid, ".system_generated", "steps")
 
     if dry_run:
-        tf_del = modify_or_truncate_jsonl(inspect_tf_path, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        tc_del = modify_or_truncate_jsonl(inspect_tc_path, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        cf_del_lines, cf_del_files = modify_or_truncate_chunks(inspect_chunks_full, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        cc_del_lines, cc_del_files = modify_or_truncate_chunks(inspect_chunks_comp, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
+        tf_del = modify_or_truncate_jsonl(inspect_tf_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
+        tc_del = modify_or_truncate_jsonl(inspect_tc_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
+        cf_del_lines, cf_del_files = modify_or_truncate_chunks(inspect_chunks_full, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
+        cc_del_lines, cc_del_files = modify_or_truncate_chunks(inspect_chunks_comp, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
         hist_del = count_or_filter_history(inspect_history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=True)
         st_del, st_mod, st_rem_files = sync_or_prune_step_dirs(
             inspect_steps_dir,
-            result_step,
+            last_result_step,
             modify_step=result_step,
             old_str=old_str,
             new_str=new_str,
@@ -2771,7 +2847,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         if bg_task_id:
             print(f"[DRY-RUN] Would remove background task log: tasks/{bg_task_id}.log")
             print(f"[DRY-RUN] Would remove background task messages for: {bg_task_id}")
-        print(f"[DRY-RUN] Steps remaining: {remaining_steps} (steps 0 to {result_step})")
+        print(f"[DRY-RUN] Steps remaining: {remaining_steps} (steps 0 to {last_result_step})")
         print(f"[DRY-RUN] Steps to be deleted from DB: {steps_to_delete}")
         print(f"[DRY-RUN] gen_metadata / executor_metadata turns remaining: {remaining_model_turns}")
         if parent_refs_to_delete:
@@ -2797,13 +2873,13 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # 1. Update conversations/<id>.db
     cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, result_step))
-    cur.execute("DELETE FROM steps WHERE idx > ?", (result_step,))
+    cur.execute("DELETE FROM steps WHERE idx > ?", (last_result_step,))
     cur.execute("DELETE FROM gen_metadata WHERE idx >= ?", (remaining_model_turns,))
     cur.execute("DELETE FROM executor_metadata WHERE idx >= ?", (remaining_model_turns,))
     if "parent_references" in tables:
-        cur.execute("DELETE FROM parent_references WHERE idx > ?", (result_step,))
+        cur.execute("DELETE FROM parent_references WHERE idx > ?", (last_result_step,))
     if "battle_mode_infos" in tables:
-        cur.execute("DELETE FROM battle_mode_infos WHERE idx > ?", (result_step,))
+        cur.execute("DELETE FROM battle_mode_infos WHERE idx > ?", (last_result_step,))
     conn.commit()
     conn.close()
 
@@ -2824,12 +2900,12 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         s_conn.close()
 
     # 3. Modify and truncate transcripts
-    tf_removed = modify_or_truncate_jsonl(transcript_full_path, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
-    tc_removed = modify_or_truncate_jsonl(transcript_compact_path, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    tf_removed = modify_or_truncate_jsonl(transcript_full_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    tc_removed = modify_or_truncate_jsonl(transcript_compact_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
 
     # 4. Modify and truncate chunk files
-    cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
-    cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
 
     # 5. Filter history.jsonl
     hist_removed = count_or_filter_history(history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=False)
@@ -2858,7 +2934,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     # 8. Synchronize and prune step output artifacts
     st_purged, st_updated, st_removed_files = sync_or_prune_step_dirs(
         steps_dir,
-        result_step,
+        last_result_step,
         modify_step=result_step,
         old_str=old_str,
         new_str=new_str,
@@ -2869,7 +2945,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # 9. Prune downstream background task logs and clean up converted background task
     tasks_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "tasks")
-    tasks_purged = prune_tasks_dir(tasks_dir, result_step + 1, dry_run=False)
+    tasks_purged = prune_tasks_dir(tasks_dir, last_result_step + 1, dry_run=False)
     if bg_task_id:
         bg_task_log = os.path.join(tasks_dir, f"{bg_task_id}.log")
         if os.path.exists(bg_task_log):
@@ -2905,7 +2981,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     if web_content_text is not None:
         print(f"  - Updated web content artifact: steps/{result_step}/content.md ({len(web_content_text)} bytes).")
     print(f"  - Deleted {steps_to_delete} downstream step(s) from 'steps' table.")
-    print(f"  - Remaining steps count: {remaining_steps} (steps 0 to {result_step}).")
+    print(f"  - Remaining steps count: {remaining_steps} (steps 0 to {last_result_step}).")
     print(f"  - Truncated {tf_removed} line(s) from transcript_full.jsonl and {tc_removed} line(s) from transcript.jsonl.")
     if cf_rem + cc_rem > 0 or cf_del + cc_del > 0:
         print(f"  - Cleaned chunk logs: truncated {cf_rem + cc_rem} record(s), purged {cf_del + cc_del} empty chunk file(s).")
@@ -2921,7 +2997,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         print(f"  - Purged {st_purged} downstream step output artifact directory(ies).")
     print(f"  - Armed conversation_summaries.db (step_count={remaining_steps}, status='CASCADE_RUN_STATUS_RUNNING', not_fully_idle=1).")
     print(f"  - Purged protobuf summary cache: jetbox_summaries_proto.pb.")
-    print(f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {conv_id}')
+    print(f"  {resume_command(base_dir, conv_id)}")
 
 
 def build_system_message_payload(conv_id: str, step_idx: int, msg_uuid: str, notice_text: str, iso_ts: str,
@@ -3746,7 +3822,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     print(f"  - Armed conversation_summaries.db (step_count={total_remaining_steps}, status='CASCADE_RUN_STATUS_RUNNING', not_fully_idle=1).")
     print(f"  - Purged protobuf summary cache: jetbox_summaries_proto.pb.")
     print(f"\nYou can now resume Antigravity with:")
-    print(f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {conv_id}')
+    print(f"  {resume_command(base_dir, conv_id)}")
 
 
 # Backward compatibility aliases
@@ -3822,6 +3898,14 @@ def check_task_log_discrepancy(target_step: int, task_id: str | None, output_tex
         ]
 
 
+def trim_turn_metadata(cur: sqlite3.Cursor, tables: list[str]) -> None:
+    """Metadata has one row per model turn, so it must shrink along with the model steps."""
+    remaining_turns = cur.execute("SELECT COUNT(*) FROM steps WHERE step_type = ?", (STEP_TYPE_MODEL_RESPONSE,)).fetchone()[0]
+    for table in ("gen_metadata", "executor_metadata"):
+        if table in tables:
+            cur.execute(f"DELETE FROM {table} WHERE idx >= ?", (remaining_turns,))
+
+
 def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                            category: str = "tool_call_task",
                            detail: str = None,
@@ -3874,6 +3958,10 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
     default_output, per_task_output = parse_task_output_spec(task_output)
     output_text = default_output
+
+    # A log option on its own changes the log, not what the agent was told
+    changes_text = bool(replace_old or replace_text is not None or file_content is not None
+                        or task_status or task_exit_code is not None)
 
     src_tf = transcript_full_path
     if not os.path.exists(src_tf) and source_base_dir:
@@ -3940,7 +4028,9 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             output_text = per_task_output.get(task_id, default_output)
 
         count = 0
-        if replace_old and replace_new is not None:
+        if not changes_text:
+            old_str = new_str = ""
+        elif replace_old and replace_new is not None:
             old_str = replace_old
             new_str = replace_new
         else:
@@ -3995,7 +4085,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             conn.close()
             searched = f"'{clean_preview(old_str, 50)}'" if old_str else "the original text"
             raise ValueError(f"Could not find {searched} in step {result_step}, so the replacement was not applied. Nothing was changed.")
-        cutoff_step = result_step
+        cutoff_step = find_last_result_step(cur, src_tf, target_step)
 
         remaining_steps = cur.execute("SELECT COUNT(*) FROM steps WHERE idx <= ?", (cutoff_step,)).fetchone()[0]
         steps_to_delete = cur.execute("SELECT COUNT(*) FROM steps WHERE idx > ?", (cutoff_step,)).fetchone()[0]
@@ -4073,6 +4163,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, result_step))
         cur.execute("DELETE FROM steps WHERE idx > ?", (cutoff_step,))
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        trim_turn_metadata(cur, tables)
         if "parent_references" in tables:
             cur.execute("DELETE FROM parent_references WHERE idx > ?", (cutoff_step,))
         if "battle_mode_infos" in tables:
@@ -4104,11 +4195,11 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                 f.write(output_text)
             log_updated = True
 
-        tf_removed = modify_or_truncate_jsonl(transcript_full_path, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
-        tc_removed = modify_or_truncate_jsonl(transcript_compact_path, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
+        tf_removed = modify_or_truncate_jsonl(transcript_full_path, cutoff_step, modify_step=(result_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
+        tc_removed = modify_or_truncate_jsonl(transcript_compact_path, cutoff_step, modify_step=(result_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
 
-        cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
-        cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
+        cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, cutoff_step, modify_step=(result_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
+        cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, cutoff_step, modify_step=(result_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
 
         hist_removed = count_or_filter_history(history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=False)
 
@@ -4131,7 +4222,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                     pass
             prune_orphan_read_json(messages_dir)
 
-        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, dry_run=False)
+        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
         tasks_purged = prune_tasks_dir(tasks_dir, cutoff_step + 1, dry_run=False)
 
         print(f"Successfully executed Intervene Mode on conversation {conv_id} at Step {target_step} ({tool_name}):")
@@ -4161,7 +4252,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
         if discrepancy_lines:
             print_standout_box(discrepancy_lines, border_char="!", file=sys.stderr)
         print(f"\nYou can now resume Antigravity with:")
-        print(f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {conv_id}')
+        print(f"  {resume_command(base_dir, conv_id)}")
         return task_id
 
     else:
@@ -4262,7 +4353,10 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
         if task_id:
             output_text = per_task_output.get(task_id, default_output)
 
-        if replace_old and replace_new is not None:
+        if not changes_text:
+            new_content = proto_content or ""
+            old_str = new_str = ""
+        elif replace_old and replace_new is not None:
             old_str = replace_old
             new_str = replace_new
             orig_text = proto_content or ""
@@ -4301,7 +4395,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             old_str = proto_content or ""
             new_str = new_content
 
-        if orig_transcript_content:
+        if changes_text and orig_transcript_content:
             if not old_str or old_str not in orig_transcript_content:
                 old_str = orig_transcript_content
                 new_str = (
@@ -4386,7 +4480,8 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                 print(f"[DRY-RUN] Task status: {task_status}")
             if task_exit_code is not None:
                 print(f"[DRY-RUN] Task exit code: {task_exit_code}")
-            print(f"[DRY-RUN] Reconstructed task notification message: '{clean_preview(new_content, 70)}'")
+            if changes_text:
+                print(f"[DRY-RUN] Reconstructed task notification message: '{clean_preview(new_content, 70)}'")
             if task_id and output_text is not None:
                 print(f"[DRY-RUN] Would update task log: tasks/{task_id}.log ({len(output_text)} bytes)")
             print(f"[DRY-RUN] Would delete {steps_to_delete} downstream step(s) from 'steps' table.")
@@ -4394,9 +4489,11 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                 print_standout_box(discrepancy_lines, border_char="!", file=sys.stderr)
             return task_id
 
-        cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, target_step))
+        if changes_text:
+            cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, target_step))
         cur.execute("DELETE FROM steps WHERE idx > ?", (cutoff_step,))
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        trim_turn_metadata(cur, tables)
         if "parent_references" in tables:
             cur.execute("DELETE FROM parent_references WHERE idx > ?", (cutoff_step,))
         if "battle_mode_infos" in tables:
@@ -4429,7 +4526,9 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             log_updated = True
 
         msg_updated = False
-        if matched_msg_file and os.path.exists(matched_msg_file):
+        if not changes_text:
+            pass
+        elif matched_msg_file and os.path.exists(matched_msg_file):
             try:
                 with open(matched_msg_file, "r", encoding="utf-8") as f:
                     d = json.load(f)
@@ -4456,11 +4555,11 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             except Exception:
                 pass
 
-        tf_removed = modify_or_truncate_jsonl(transcript_full_path, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
-        tc_removed = modify_or_truncate_jsonl(transcript_compact_path, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
+        tf_removed = modify_or_truncate_jsonl(transcript_full_path, cutoff_step, modify_step=(cutoff_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
+        tc_removed = modify_or_truncate_jsonl(transcript_compact_path, cutoff_step, modify_step=(cutoff_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
 
-        cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
-        cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, cutoff_step, modify_step=cutoff_step, old_str=old_str, new_str=new_str, dry_run=False)
+        cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, cutoff_step, modify_step=(cutoff_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
+        cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, cutoff_step, modify_step=(cutoff_step if changes_text else None), old_str=old_str, new_str=new_str, dry_run=False)
 
         hist_removed = count_or_filter_history(history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=False)
 
@@ -4485,7 +4584,8 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                     pass
             prune_orphan_read_json(messages_dir)
 
-        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, dry_run=False)
+        # Passing modify_step keeps the selected step's own folder, which is otherwise treated as discarded
+        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=cutoff_step, dry_run=False)
         tasks_purged = prune_tasks_dir(tasks_dir, cutoff_step + 1, dry_run=False)
 
         print(f"Successfully executed Intervene Mode on conversation {conv_id} at Step {target_step} (Task Notification: {sender}):")
@@ -4516,7 +4616,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
         if discrepancy_lines:
             print_standout_box(discrepancy_lines, border_char="!", file=sys.stderr)
         print(f"\nYou can now resume Antigravity with:")
-        print(f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {conv_id}')
+        print(f"  {resume_command(base_dir, conv_id)}")
         return task_id
 
 
@@ -4699,7 +4799,7 @@ def execute_kickstart_cleanup(
 
     # 4. Update conversation_summaries.db
     if os.path.exists(target_summary_db):
-        with sqlite3.connect(target_summary_db) as s_conn:
+        with open_database(target_summary_db) as s_conn:
             s_cur = s_conn.cursor()
             s_cur.execute("""
                 UPDATE conversation_summaries
@@ -4739,6 +4839,19 @@ def execute_kickstart_cleanup(
     print(f"  - Purged summary protobuf cache and presence locks.")
 
 
+def copy_database(source: str, destination: str) -> None:
+    """Copies through SQLite, because Antigravity's WAL databases can keep recent steps in a file beside the database."""
+    # With no log beside it, "immutable" stops SQLite leaving new side files next to the original
+    access = "mode=ro" if os.path.exists(f"{source}-wal") else "immutable=1"
+    source_conn = sqlite3.connect(f"{pathlib.Path(os.path.abspath(source)).as_uri()}?{access}", uri=True)
+    destination_conn = sqlite3.connect(destination)
+    try:
+        source_conn.backup(destination_conn)
+    finally:
+        destination_conn.close()
+        source_conn.close()
+
+
 def setup_fork_destination(
     base_dir: str,
     parent_conv_id: str,
@@ -4771,7 +4884,7 @@ def setup_fork_destination(
 
     # 1. Copy conversation database
     os.makedirs(conv_dir, exist_ok=True)
-    shutil.copyfile(parent_db, fork_db)
+    copy_database(parent_db, fork_db)
 
     # 2. Copy brain directory if present
     if os.path.exists(parent_brain):
@@ -4781,7 +4894,7 @@ def setup_fork_destination(
     # 3. Register fork in conversation_summaries.db and conversation_lineage
     now_iso = datetime.now(timezone.utc).isoformat()
     if os.path.exists(summary_db_path):
-        with sqlite3.connect(summary_db_path) as s_conn:
+        with open_database(summary_db_path) as s_conn:
             s_conn.row_factory = sqlite3.Row
             s_cur = s_conn.cursor()
 
@@ -4808,15 +4921,11 @@ def setup_fork_destination(
             if parent_row:
                 row_dict = dict(parent_row)
                 row_dict["conversation_id"] = fork_conv_id
-                if "parent_conversation_id" in table_cols:
-                    row_dict["parent_conversation_id"] = parent_conv_id
                 if "title" in table_cols:
                     orig_title = row_dict.get("title", "") or ""
                     row_dict["title"] = f"[{branch_name}] {orig_title}".strip()
                 if "last_modified_time" in table_cols:
                     row_dict["last_modified_time"] = now_iso
-                if "nesting_depth" in table_cols:
-                    row_dict["nesting_depth"] = (row_dict.get("nesting_depth") or 0) + 1
 
                 insert_cols = [c for c in table_cols if c in row_dict]
                 col_names = ", ".join(insert_cols)
@@ -4832,8 +4941,8 @@ def setup_fork_destination(
                     INSERT OR REPLACE INTO conversation_summaries (
                         conversation_id, title, preview, step_count, last_modified_time,
                         workspace_uris, status, parent_conversation_id, last_user_input_time
-                    ) VALUES (?, ?, '', 0, ?, '', '', ?, ?)
-                """, (fork_conv_id, f"[{branch_name}] Fork @ Step {target_step}", now_iso, parent_conv_id, now_iso))
+                    ) VALUES (?, ?, '', 0, ?, '', '', '', ?)
+                """, (fork_conv_id, f"[{branch_name}] Fork @ Step {target_step}", now_iso, now_iso))
 
             # Record lineage
             s_cur.execute("""
@@ -4844,23 +4953,13 @@ def setup_fork_destination(
             s_conn.commit()
 
 
-FORK_AT_SUBAGENT_REPORT_ERROR = (
-    "Forking at a subagent report is not supported yet. The fork would share the child "
-    "subagent conversation with its parent, so the intervention would permanently change "
-    "the child that the parent still points to. Use --out-dir to work on a full copy instead."
-)
 TOOL_INTERVENTION_CATEGORIES = ("tool_call_read", "tool_call_command", "tool_call_write", "tool_call_web", "tool_call_inquiry")
 TASK_INTERVENTION_CATEGORIES = ("tool_call_task", "task_notification")
 
 
 def validate_fork_request(category: str, kwargs: dict, task_output: str | list[str] | None, keep_task_log: bool) -> None:
     """Raises ValueError for a fork that could not produce a correct result, before anything is copied."""
-    # execute_subagent_intervene edits the child conversation by ID, and a fork does not
-    # copy the child, so it would change the parent's child. The subagent_report branches
-    # in execute_fork stay in place for when forks clone the child.
-    if category == "subagent_report":
-        raise ValueError(FORK_AT_SUBAGENT_REPORT_ERROR)
-    if category in ("prompt", "model_response"):
+    if category in ("prompt", "model_response", "subagent_report"):
         return
     if category not in TOOL_INTERVENTION_CATEGORIES + TASK_INTERVENTION_CATEGORIES:
         raise ValueError(f"Cannot fork at a step of type '{category}'.")
@@ -4874,6 +4973,141 @@ def validate_fork_request(category: str, kwargs: dict, task_output: str | list[s
         has_content = has_content or task_output is not None or keep_task_log
     if not has_content:
         raise ValueError(f"Forking at a step of type '{category}' requires intervention content.")
+
+
+def replace_identifiers(value, replacements: dict[str, str]):
+    """Swaps IDs inside a stored value. Protobuf records lengths, so a change of length must rewrite them."""
+    if isinstance(value, str):
+        for old, new in replacements.items():
+            value = value.replace(old, new)
+    elif isinstance(value, bytes):
+        for old, new in replacements.items():
+            old_bytes, new_bytes = old.encode("utf-8"), new.encode("utf-8")
+            if old_bytes in value:
+                same_length = len(old_bytes) == len(new_bytes)
+                value = value.replace(old_bytes, new_bytes) if same_length else replace_in_bytes(value, old_bytes, new_bytes)[0]
+    return value
+
+
+def rewrite_conversation_ids(base_dir: str, conv_ids: list[str], replacements: dict[str, str]) -> None:
+    """
+    Makes copied conversations their own. Antigravity looks a conversation up by the ID stored inside its
+    database, and every step and task name repeats it, so a plain copy would still act as the original.
+    """
+    for conv_id in conv_ids:
+        with open_database(os.path.join(base_dir, "conversations", f"{conv_id}.db")) as conn:
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            if "trajectory_meta" in tables:
+                for (trajectory_id,) in conn.execute("SELECT trajectory_id FROM trajectory_meta").fetchall():
+                    if trajectory_id:
+                        replacements.setdefault(trajectory_id, str(uuid.uuid4()))
+
+    for conv_id in conv_ids:
+        with open_database(os.path.join(base_dir, "conversations", f"{conv_id}.db")) as conn:
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            for table in tables:
+                columns = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+                column_list = ", ".join(f'"{column}"' for column in columns)
+                for row in conn.execute(f'SELECT rowid, {column_list} FROM "{table}"').fetchall():
+                    for column, value in zip(columns, row[1:]):
+                        new_value = replace_identifiers(value, replacements)
+                        if new_value != value:
+                            conn.execute(f'UPDATE "{table}" SET "{column}" = ? WHERE rowid = ?', (new_value, row[0]))
+
+        for folder, _, names in os.walk(os.path.join(base_dir, "brain", conv_id)):
+            for name in names:
+                path = os.path.join(folder, name)
+                if os.path.islink(path):
+                    continue
+                with open(path, "rb") as f:
+                    data = f.read()
+                new_data = replace_identifiers(data, replacements)
+                if new_data != data:
+                    # Later cleanup goes by modification time, so this rewrite must not look like a recent change
+                    times = os.stat(path)
+                    with open(path, "wb") as f:
+                        f.write(new_data)
+                    os.utime(path, (times.st_atime, times.st_mtime))
+                new_name = replace_identifiers(name, replacements)
+                if new_name != name:
+                    os.rename(path, os.path.join(folder, new_name))
+
+
+def find_last_kept_step(base_dir: str, conv_id: str, target_step: int, category: str) -> int:
+    """Returns the last step a fork keeps, which depends on what kind of step it was made at."""
+    if category in ("prompt", "model_response"):
+        return target_step - 1
+    if category.startswith("tool_call_"):
+        transcript = os.path.join(base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+        with open_database(os.path.join(base_dir, "conversations", f"{conv_id}.db")) as conn:
+            return find_last_result_step(conn.cursor(), transcript, target_step)
+    return target_step
+
+
+def clone_kept_subagents(base_dir: str, source_id: str, new_parent_id: str, last_kept_step: int | None,
+                         replacements: dict[str, str], created: list[str], required_id: str | None = None) -> None:
+    """
+    Gives a fork its own copy of every subagent its steps still refer to. A resumed conversation and any
+    intervention write to a subagent by its ID, so sharing one would change the original session's subagent.
+    last_kept_step is None for a copied subagent, whose whole history is kept along with its own subagents.
+    required_id is a subagent the fork is about to change, which must be copied whatever the steps say.
+    """
+    summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
+    children = []
+    if os.path.exists(summary_db_path):
+        with open_database(summary_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            if "conversation_summaries" in tables:
+                columns = [r[1] for r in conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()]
+                if "parent_conversation_id" in columns:
+                    children = [dict(row) for row in conn.execute(
+                        "SELECT * FROM conversation_summaries WHERE parent_conversation_id = ?", (source_id,)).fetchall()]
+                if required_id and required_id not in {child["conversation_id"] for child in children}:
+                    # The catalog may not link the subagent to its parent, but it must still be copied
+                    row = conn.execute("SELECT * FROM conversation_summaries WHERE conversation_id = ?", (required_id,)).fetchone()
+                    children.append(dict(row) if row else {"conversation_id": required_id, "_no_catalog_row": True})
+    elif required_id:
+        children.append({"conversation_id": required_id, "_no_catalog_row": True})
+    if not children:
+        return
+
+    kept_payloads = []
+    if last_kept_step is not None:
+        with open_database(os.path.join(base_dir, "conversations", f"{new_parent_id}.db")) as conn:
+            kept_payloads = [row[0] or b"" for row in conn.execute(
+                "SELECT step_payload FROM steps WHERE idx <= ?", (last_kept_step,)).fetchall()]
+
+    for child in children:
+        child_id = child["conversation_id"]
+        child_db = os.path.join(base_dir, "conversations", f"{child_id}.db")
+        kept = (last_kept_step is None or child_id == required_id
+                or any(child_id.encode("utf-8") in payload for payload in kept_payloads))
+        if not kept or not os.path.exists(child_db):
+            descriptor = os.path.join(base_dir, "brain", new_parent_id, ".system_generated", "subagents", f"{child_id}.json")
+            if os.path.exists(descriptor):
+                os.remove(descriptor)
+            continue
+
+        clone_id = str(uuid.uuid4())
+        created.append(clone_id)
+        replacements[child_id] = clone_id
+        copy_database(child_db, os.path.join(base_dir, "conversations", f"{clone_id}.db"))
+        child_brain = os.path.join(base_dir, "brain", child_id)
+        if os.path.isdir(child_brain):
+            shutil.copytree(child_brain, os.path.join(base_dir, "brain", clone_id), symlinks=True)
+
+        if not child.get("_no_catalog_row"):
+            row = dict(child, conversation_id=clone_id)
+            if "parent_conversation_id" in row:
+                row["parent_conversation_id"] = new_parent_id
+            with open_database(summary_db_path) as conn:
+                names = list(row)
+                conn.execute(
+                    f"INSERT OR REPLACE INTO conversation_summaries ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+                    [row[name] for name in names])
+
+        clone_kept_subagents(base_dir, child_id, clone_id, None, replacements, created)
 
 
 def remove_failed_fork(base_dir: str, fork_conv_id: str) -> None:
@@ -4955,6 +5189,7 @@ def execute_fork(
 
     src_bdir = base_dir if dry_run else None
     target_task = None
+    created = [fork_cid]
 
     try:
         setup_fork_destination(
@@ -4966,6 +5201,23 @@ def execute_fork(
             dry_run=dry_run,
             intervention_type=it_type
         )
+
+        if not dry_run:
+            replacements = {parent_conv_id: fork_cid}
+            last_kept_step = find_last_kept_step(base_dir, fork_cid, target_step, category)
+            changed_subagent = None
+            if category == "subagent_report":
+                # Found from the parent, because the intervention below must never reach this original
+                changed_subagent = kwargs.get("sender_uuid") or detect_step_info(base_dir, parent_conv_id, target_step)[1]
+                kwargs["sender_uuid"] = changed_subagent
+            clone_kept_subagents(base_dir, parent_conv_id, fork_cid, last_kept_step, replacements, created, changed_subagent)
+            rewrite_conversation_ids(base_dir, created, replacements)
+            # The request named the originals, so it must now name the copies
+            for key in ("sender_uuid", "detail", "replace_old"):
+                if kwargs.get(key):
+                    kwargs[key] = replace_identifiers(kwargs[key], replacements)
+            if len(created) > 1:
+                print(f"  - Copied {len(created) - 1} subagent conversation(s) for this fork, so the originals stay untouched.")
 
         if category in ("prompt", "model_response"):
             execute_rewind(
@@ -5014,7 +5266,8 @@ def execute_fork(
         write_future_task_logs(base_dir, fork_cid, future_tasks, task_output, skip_task=target_task, dry_run=dry_run)
     except BaseException:
         if not dry_run:
-            remove_failed_fork(base_dir, fork_cid)
+            for conv_id in created:
+                remove_failed_fork(base_dir, conv_id)
         raise
 
     return fork_cid
@@ -5027,7 +5280,7 @@ def render_lineage_tree(base_dir: str) -> None:
         print("No conversation_summaries.db found. No conversations to display.")
         return
 
-    with sqlite3.connect(summary_db_path) as conn:
+    with open_database(summary_db_path) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
@@ -5106,7 +5359,7 @@ def list_conversation_branches(base_dir: str) -> None:
         print("No conversation_summaries.db found.")
         return
 
-    with sqlite3.connect(summary_db_path) as conn:
+    with open_database(summary_db_path) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
@@ -5184,7 +5437,7 @@ def main():
     parser.add_argument(
         "--sync", "-s",
         action="store_true",
-        help="Force re-running the parser pipeline even if cached results are up-to-date."
+        help="Force re-running the optional ACTF parser (cli.py) even if cached results are up-to-date."
     )
     # Intervention arguments
     parser.add_argument(
@@ -5282,7 +5535,7 @@ def main():
         nargs="?",
         const="branch",
         default=None,
-        help="Create a non-destructive conversation fork/branch at the target step instead of modifying the parent conversation in place. Optional value specifies branch name/label (default: 'branch'). Not available at subagent report steps."
+        help="Create a non-destructive conversation fork/branch at the target step instead of modifying the parent conversation in place. Optional value specifies branch name/label (default: 'branch')."
     )
     parser.add_argument(
         "--tree", "-t", "--lineage",
@@ -5407,11 +5660,6 @@ def main():
                 print(error_msg, file=sys.stderr)
                 sys.exit(1)
 
-            # Checked before the task-log options, which would not help a fork that cannot happen
-            if getattr(args, "fork", None) is not None and category == "subagent_report":
-                print_standout_box([f"Error: {FORK_AT_SUBAGENT_REPORT_ERROR}"], border_char="!", file=sys.stderr)
-                sys.exit(1)
-
             # Strict option validation per category and tool type
             has_replace_opts = any([args.replace_old, args.replace_new, args.replace_text, args.replace_file])
             has_error_opt = args.simulate_error is not None
@@ -5420,7 +5668,6 @@ def main():
             has_subagent_opts = bool(args.subagent_exit is not None or args.subagent_error_msg or getattr(args, "child_step", None) is not None)
             has_task_intervene_opts = bool(args.task_status or args.task_exit_code is not None)
             has_task_log_opts = bool(args.task_output is not None or getattr(args, "keep_task_log", False))
-            has_task_opts = bool(has_task_intervene_opts or has_task_log_opts)
 
             default_output, _ = parse_task_output_spec(args.task_output)
 
@@ -5548,12 +5795,6 @@ def main():
                     sys.exit(1)
 
             if category == "subagent_report":
-                if has_error_opt or has_web_opt or has_inquiry_opts or has_task_opts:
-                    print(
-                        "Error: --simulate-error, --replace-web-content, --choice, --write-in, and --task-* cannot be used when intervening on a subagent report.",
-                        file=sys.stderr
-                    )
-                    sys.exit(1)
                 exit_mode = args.subagent_exit or "crash"
                 if exit_mode == "keep-alive" and not has_replace_opts:
                     print(
@@ -5643,7 +5884,7 @@ def main():
                         f"Parent ID   : {conv_id}",
                         f"Fork Step   : {target_step}",
                         "Parent conversation would remain completely unmodified."
-                    ], border_char="*")
+                    ], border_char="*", file=sys.stderr)
                 else:
                     print_standout_box([
                         "Fork created successfully!",
@@ -5654,8 +5895,8 @@ def main():
                         "",
                         "Parent conversation remains untouched.",
                         "To interact with this branch in Antigravity:",
-                        f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {fork_cid}'
-                    ], border_char="*")
+                        f"  {resume_command(base_dir, fork_cid)}"
+                    ], border_char="*", file=sys.stderr)
                 return
 
             if raw_dest != raw_source:
@@ -5742,13 +5983,16 @@ def main():
                                    skip_task=target_tid, dry_run=args.dry_run)
             return
 
-    # For listing or searching, ensure pipeline output is synced
-    try:
-        events_path = sync_pipeline(base_dir, conv_id, args.parser_output, force=args.sync)
-        events = load_events(events_path)
-    except Exception as exc:
-        print(f"[Warning] Failed to load parsed events from pipeline: {exc}", file=sys.stderr)
-        events = None
+    # The ACTF parser is optional, and without it the transcripts are the source for listing and searching
+    events = None
+    if os.path.isfile(CLI_PATH):
+        try:
+            events_path = sync_pipeline(base_dir, conv_id, args.parser_output, force=args.sync)
+            events = load_events(events_path)
+        except Exception as exc:
+            print(f"[Warning] Failed to load parsed events from pipeline: {exc}", file=sys.stderr)
+    elif args.sync:
+        print("[Note] --sync has no effect without the optional ACTF parser (cli.py).", file=sys.stderr)
 
     if args.list:
         if events:
@@ -5757,7 +6001,6 @@ def main():
             # Fallback to raw transcript if available
             raw_steps = load_transcript_fallback(base_dir, conv_id)
             if raw_steps:
-                print("Transcript log fallback:")
                 fallback_events = transcript_to_events(raw_steps)
                 list_events(fallback_events, conv_id, full=args.full)
             else:

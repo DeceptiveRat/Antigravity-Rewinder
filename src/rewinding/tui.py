@@ -4,12 +4,15 @@ Provides keyboard-driven step scrubbing, untruncated turn inspection,
 and direct one-key rewinding and counterfactual intervention.
 """
 
+import contextlib
 from dataclasses import dataclass, field
+import io
 import json
 import os
 import re
 import sqlite3
 import sys
+import textwrap
 from typing import Any
 
 try:
@@ -20,6 +23,7 @@ except ModuleNotFoundError:
 detect_step_info = rewind_mod.detect_step_info
 execute_rewind = rewind_mod.execute_rewind
 execute_tool_intervene = rewind_mod.execute_tool_intervene
+execute_task_intervene = rewind_mod.execute_task_intervene
 execute_fork = getattr(rewind_mod, "execute_fork", None)
 find_downstream_task_completions = rewind_mod.find_downstream_task_completions
 find_future_task_logs = rewind_mod.find_future_task_logs
@@ -28,9 +32,11 @@ clean_preview = rewind_mod.clean_preview
 STEP_TYPE_USER_INPUT = rewind_mod.STEP_TYPE_USER_INPUT
 STEP_TYPE_MODEL_RESPONSE = rewind_mod.STEP_TYPE_MODEL_RESPONSE
 
-# The fork key asks for replacement text on these steps, since changing their result is the point of forking there
+# The fork and intervene keys ask for replacement text on these steps
 REPLACEABLE_CATEGORIES = rewind_mod.TOOL_INTERVENTION_CATEGORIES + rewind_mod.TASK_INTERVENTION_CATEGORIES
-FORKABLE_CATEGORIES = ("prompt", "model_response") + REPLACEABLE_CATEGORIES
+# A fork has its own copy of a subagent, so unlike the intervene key it can also change a subagent's report
+FORK_TEXT_CATEGORIES = REPLACEABLE_CATEGORIES + ("subagent_report",)
+FORKABLE_CATEGORIES = ("prompt", "model_response") + FORK_TEXT_CATEGORIES
 
 
 def clear_log_spec(future_tasks: list[tuple[str, int, int]]) -> list[str]:
@@ -40,6 +46,11 @@ def clear_log_spec(future_tasks: list[tuple[str, int, int]]) -> list[str]:
 
 def task_logs_kept_message(future_tasks: list[tuple[str, int, int]]) -> str:
     return f"Cancelled: {len(future_tasks)} task log(s) would keep future output."
+
+
+def first_line(exc: Exception) -> str:
+    """The status bar shows one line, so a multi-line error keeps only its first."""
+    return (str(exc).splitlines() or [""])[0]
 
 
 @dataclass
@@ -264,6 +275,9 @@ class RewindTUIApp:
         self.dry_run: bool = dry_run
         self.status_msg: str = "Ready. Use Up/Down to select step. [B] Before-Resp, [R] Rewind, [I] Intervene, [Q] Quit."
         self.is_running: bool = True
+        self.stdscr = None
+        self.last_output: list[str] = []
+        self.last_notice: list[str] = []
 
     # ----------------------------------------------------------------------
     # Headless State & Navigation Helpers (Unit Testable)
@@ -293,6 +307,18 @@ class RewindTUIApp:
             return self.loader.steps[self.cursor]
         return None
 
+    @contextlib.contextmanager
+    def _captured_output(self):
+        """The engine functions report with print, which would write over the curses screen."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                yield
+        finally:
+            self.last_output = stdout.getvalue().splitlines()
+            # Notices arrive in a box, and its border rows mean nothing in a dialog
+            self.last_notice = [line for line in stderr.getvalue().splitlines() if len(set(line.strip())) > 1]
+
     def execute_action_rewind(self, arm_running: bool = False, clear_task_logs: bool = False) -> tuple[bool, str]:
         """Performs rewind action on the currently selected step."""
         step = self.get_selected_step()
@@ -306,14 +332,15 @@ class RewindTUIApp:
                 self.status_msg = msg
                 return False, msg
 
-            execute_rewind(
-                self.base_dir,
-                self.conv_id,
-                target_step=step.idx,
-                dry_run=self.dry_run,
-                arm_running=arm_running
-            )
-            write_future_task_logs(self.base_dir, self.conv_id, future_tasks, clear_log_spec(future_tasks), dry_run=self.dry_run)
+            with self._captured_output():
+                execute_rewind(
+                    self.base_dir,
+                    self.conv_id,
+                    target_step=step.idx,
+                    dry_run=self.dry_run,
+                    arm_running=arm_running
+                )
+                write_future_task_logs(self.base_dir, self.conv_id, future_tasks, clear_log_spec(future_tasks), dry_run=self.dry_run)
             if not self.dry_run:
                 self.loader.reload()
                 self.cursor = max(0, min(self.cursor, len(self.loader.steps) - 1))
@@ -323,9 +350,39 @@ class RewindTUIApp:
             self.status_msg = msg
             return True, msg
         except Exception as exc:
-            msg = f"Rewind failed: {exc}"
+            msg = f"Rewind failed: {first_line(exc)}"
             self.status_msg = msg
             return False, msg
+
+    def _intervene_refusal(self, step: StepItem) -> str | None:
+        """Explains why the selected step cannot be changed with this key, or returns None if it can."""
+        if step.category in REPLACEABLE_CATEGORIES:
+            return None
+        if step.category == "subagent_report":
+            return "Cannot change a subagent report here; use --subagent-exit on the command line."
+        if step.category == "tool_call_other":
+            return f"Cannot intervene on step {step.idx}: results of {step.detail} cannot be changed."
+        return f"Step {step.idx} ({step.category}) cannot be intervened upon."
+
+    def _intervene_on_task(self, step: StepItem, replace_old: str, replace_new: str, replace_text: str,
+                           future_tasks: list[tuple[str, int, int]]) -> str | None:
+        """Changes a task step through the task code. A blank search text replaces the whole text, as on other tools."""
+        whole_text = replace_text or (replace_new if not replace_old else None)
+        if not whole_text and not replace_new:
+            result_step = step.idx + 1 if step.category == "tool_call_task" else step.idx
+            raise ValueError(f"The replacement text is empty, so step {result_step} would not change. Nothing was changed.")
+        return execute_task_intervene(
+            self.base_dir,
+            self.conv_id,
+            step.idx,
+            category=step.category,
+            detail=step.detail,
+            replace_old=(replace_old or None),
+            replace_new=(replace_new if replace_old else None),
+            replace_text=whole_text,
+            task_output=(clear_log_spec(future_tasks) if future_tasks else None),
+            dry_run=self.dry_run
+        )
 
     def execute_action_intervene(self, replace_old: str = None, replace_new: str = None,
                                   replace_text: str = None, simulate_error: str = None,
@@ -335,10 +392,10 @@ class RewindTUIApp:
         if not step:
             return False, "No step selected."
 
-        if not step.category.startswith("tool_call_") and step.category not in ("task_notification", "subagent_report"):
-            msg = f"Step {step.idx} ({step.category}) cannot be intervened upon."
-            self.status_msg = msg
-            return False, msg
+        refusal = self._intervene_refusal(step)
+        if refusal:
+            self.status_msg = refusal
+            return False, refusal
 
         try:
             future_tasks = find_future_task_logs(self.base_dir, self.conv_id, step.idx, step.category, simulate_error)
@@ -347,18 +404,24 @@ class RewindTUIApp:
                 self.status_msg = msg
                 return False, msg
 
-            execute_tool_intervene(
-                self.base_dir,
-                self.conv_id,
-                target_step=step.idx,
-                tool_name=step.detail or "tool",
-                replace_old=replace_old,
-                replace_new=replace_new,
-                replace_text=replace_text,
-                simulate_error=simulate_error,
-                dry_run=self.dry_run
-            )
-            write_future_task_logs(self.base_dir, self.conv_id, future_tasks, clear_log_spec(future_tasks), dry_run=self.dry_run)
+            target_task = None
+            with self._captured_output():
+                if step.category in rewind_mod.TASK_INTERVENTION_CATEGORIES:
+                    target_task = self._intervene_on_task(step, replace_old, replace_new, replace_text, future_tasks)
+                else:
+                    execute_tool_intervene(
+                        self.base_dir,
+                        self.conv_id,
+                        target_step=step.idx,
+                        tool_name=step.detail or "tool",
+                        replace_old=replace_old,
+                        replace_new=replace_new,
+                        replace_text=replace_text,
+                        simulate_error=simulate_error,
+                        dry_run=self.dry_run
+                    )
+                write_future_task_logs(self.base_dir, self.conv_id, future_tasks, clear_log_spec(future_tasks),
+                                       skip_task=target_task, dry_run=self.dry_run)
             if not self.dry_run:
                 self.loader.reload()
                 self.cursor = max(0, min(self.cursor, len(self.loader.steps) - 1))
@@ -367,7 +430,7 @@ class RewindTUIApp:
             self.status_msg = msg
             return True, msg
         except Exception as exc:
-            msg = f"Intervention failed: {exc}"
+            msg = f"Intervention failed: {first_line(exc)}"
             self.status_msg = msg
             return False, msg
 
@@ -384,8 +447,6 @@ class RewindTUIApp:
             return None
         if category == "tool_result":
             return f"Cannot fork at a tool result; select the tool call at step {step.idx - 1}."
-        if category == "subagent_report":
-            return "Cannot fork at a subagent report yet; it would change the shared subagent."
         if category == "tool_call_other":
             return f"Cannot fork at step {step.idx}: results of {step.detail} cannot be changed."
         return f"Cannot fork at step {step.idx}: {category} steps cannot be changed."
@@ -411,26 +472,30 @@ class RewindTUIApp:
             intervention_kwargs = {"tool_name": step.detail or "tool", "replace_text": replace_text}
         elif category in rewind_mod.TASK_INTERVENTION_CATEGORIES:
             intervention_kwargs = {"detail": step.detail, "replace_text": replace_text}
+        elif category == "subagent_report":
+            # keep-alive changes only the text that was typed, without inventing a crash
+            intervention_kwargs = {"sender_uuid": step.detail, "replace_text": replace_text, "subagent_exit": "keep-alive"}
 
         try:
             future_tasks = find_future_task_logs(self.base_dir, self.conv_id, step.idx, category)
-            fork_cid = execute_fork(
-                base_dir=self.base_dir,
-                parent_conv_id=self.conv_id,
-                target_step=step.idx,
-                branch_name=branch_name,
-                dry_run=self.dry_run,
-                arm_running=(category == "model_response"),
-                category=category,
-                intervention_kwargs=intervention_kwargs,
-                task_output=(clear_log_spec(future_tasks) if clear_task_logs and future_tasks else None)
-            )
+            with self._captured_output():
+                fork_cid = execute_fork(
+                    base_dir=self.base_dir,
+                    parent_conv_id=self.conv_id,
+                    target_step=step.idx,
+                    branch_name=branch_name,
+                    dry_run=self.dry_run,
+                    arm_running=(category == "model_response"),
+                    category=category,
+                    intervention_kwargs=intervention_kwargs,
+                    task_output=(clear_log_spec(future_tasks) if clear_task_logs and future_tasks else None)
+                )
             mode_tag = " [DRY-RUN]" if self.dry_run else ""
             msg = f"Forked to branch '{branch_name}' ({fork_cid[:8]}...){mode_tag}."
             self.status_msg = msg
             return True, msg, fork_cid
         except Exception as exc:
-            msg = f"Fork failed: {exc}"
+            msg = f"Fork failed: {first_line(exc)}"
             self.status_msg = msg
             return False, msg, None
 
@@ -500,6 +565,13 @@ class RewindTUIApp:
     # Curses Render Loop
     # ----------------------------------------------------------------------
 
+    def header_line(self, width: int) -> str:
+        """Builds the header row to fill the window exactly. The dry-run tag comes first so it can never be cut off."""
+        dry_tag = " [DRY-RUN ON]" if self.dry_run else ""
+        left = f"{dry_tag} AGY_REWIND: {self.conv_id[:18]}... | Status: {self.loader.status} "
+        right = f" Total: {len(self.loader.steps)} turns "
+        return (left + " " * max(0, width - len(left) - len(right)) + right)[:width]
+
     def run(self, stdscr):
         """Main curses interactive event loop."""
         import curses
@@ -533,13 +605,8 @@ class RewindTUIApp:
             stdscr.erase()
 
             # 1. Header (lines 0-1)
-            dry_tag = " [DRY-RUN ON]" if self.dry_run else ""
-            header_left = f" AGY_REWIND: {self.conv_id[:18]}... | Status: {self.loader.status}{dry_tag} "
-            header_right = f" Total: {len(self.loader.steps)} turns "
             stdscr.attron(curses.A_REVERSE | curses.A_BOLD)
-            stdscr.addstr(0, 0, header_left)
-            space_len = max(0, max_x - len(header_left) - len(header_right))
-            stdscr.addstr(0, len(header_left), " " * space_len + header_right)
+            stdscr.addstr(0, 0, self.header_line(max_x))
             stdscr.attroff(curses.A_REVERSE | curses.A_BOLD)
 
             # Dimensions
@@ -724,7 +791,16 @@ class RewindTUIApp:
 
         future_tasks = find_downstream_task_completions(self.base_dir, self.conv_id, step.idx)
         if self._ask_to_clear_task_logs(future_tasks):
-            self.execute_action_rewind(arm_running=arm_running, clear_task_logs=True)
+            success, _ = self.execute_action_rewind(arm_running=arm_running, clear_task_logs=True)
+            if success:
+                self._show_action_output()
+
+    def _show_action_output(self):
+        """Shows what the status bar cannot: a dry-run's preview and any notice from the tool."""
+        if self.dry_run and (self.last_output or self.last_notice):
+            self._show_text_dialog("Dry-run preview", self.last_output + self.last_notice)
+        elif self.last_notice:
+            self._show_text_dialog("Notice", self.last_notice)
 
     def _ask_to_clear_task_logs(self, future_tasks: list[tuple[str, int, int]]) -> bool:
         """Asks whether to empty logs holding future output. Returns False if the action should be cancelled."""
@@ -748,7 +824,7 @@ class RewindTUIApp:
 
         category = self._fork_category(step, arm_running)
         replace_text = None
-        if category in REPLACEABLE_CATEGORIES:
+        if category in FORK_TEXT_CATEGORIES:
             noun = "tool result" if category.startswith("tool_call_") else "message"
             replace_text = self._show_input_dialog(f"Replacement text for the whole {noun}:")
             if replace_text is None or not replace_text.strip():
@@ -769,6 +845,8 @@ class RewindTUIApp:
             replace_text=replace_text,
             clear_task_logs=True
         )
+        if success:
+            self._show_action_output()
         if success and not self.dry_run and new_cid:
             switch_now = self._show_confirm_dialog(f"Forked to {new_cid[:8]}... Switch TUI to new branch? [y/N]:")
             if switch_now:
@@ -784,8 +862,9 @@ class RewindTUIApp:
         if not step:
             return
 
-        if not step.category.startswith("tool_call_") and step.category not in ("task_notification", "subagent_report"):
-            self.status_msg = f"Step {step.idx} is not an intervenable tool or notification."
+        refusal = self._intervene_refusal(step)
+        if refusal:
+            self.status_msg = refusal
             return
 
         old_str = self._show_input_dialog("Enter substring to match & replace (--replace-old):")
@@ -796,7 +875,9 @@ class RewindTUIApp:
             return
 
         if self._ask_to_clear_task_logs(find_future_task_logs(self.base_dir, self.conv_id, step.idx, step.category)):
-            self.execute_action_intervene(replace_old=old_str, replace_new=new_str, clear_task_logs=True)
+            success, _ = self.execute_action_intervene(replace_old=old_str, replace_new=new_str, clear_task_logs=True)
+            if success:
+                self._show_action_output()
 
     def _show_confirm_dialog(self, prompt: str) -> bool:
         """Displays a simple yes/no modal popup."""
@@ -823,6 +904,39 @@ class RewindTUIApp:
                 return True
             if ch in (ord('n'), ord('N'), 27):
                 return False
+
+    def _show_text_dialog(self, title: str, lines: list[str]):
+        """Shows text in a popup, one page at a time. Any key moves on."""
+        import curses
+
+        if not self.stdscr:
+            return
+
+        max_y, max_x = self.stdscr.getmaxyx()
+        box_w = max(20, max_x - 4)
+        box_h = max(6, max_y - 2)
+        text_w = box_w - 4
+        page_size = box_h - 4
+
+        wrapped = []
+        for line in lines:
+            wrapped.extend(textwrap.wrap(line, text_w) or [""])
+
+        win = curses.newwin(box_h, box_w, max(0, (max_y - box_h) // 2), max(0, (max_x - box_w) // 2))
+        win.keypad(True)
+        for start in range(0, len(wrapped), page_size):
+            win.erase()
+            win.box()
+            footer = "Press any key to continue" if start + page_size < len(wrapped) else "Press any key to close"
+            rows = [(1, title, curses.A_BOLD), (box_h - 2, footer, curses.A_DIM)]
+            rows += [(2 + i, text, curses.A_NORMAL) for i, text in enumerate(wrapped[start:start + page_size])]
+            for row, text, attribute in rows:
+                try:
+                    win.addstr(row, 2, text[:text_w], attribute)
+                except curses.error:
+                    pass
+            win.refresh()
+            win.getch()
 
     def _show_input_dialog(self, prompt: str) -> str | None:
         """Displays a modal single-line text input popup."""
