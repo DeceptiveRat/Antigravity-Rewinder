@@ -29,8 +29,10 @@ from test_forks import (
     bytes_field,
     error_box,
     int_field,
+    lineage,
     open_db,
     open_tui,
+    originals,
     run_cli,
     run_real_tui,
     snapshot,
@@ -1345,3 +1347,43 @@ def test_report_change_keeps_the_folder_of_the_step_it_keeps(base_dir, monkeypat
     run_cli(monkeypatch, base_dir, "15", "--subagent-exit", exit_mode, "--replace-text", "NEW REPORT")
 
     assert step_folders(base_dir) == {name: f"output of step {name}" for name in kept}
+
+
+# ---------------------------------------------------------------------------
+# A fork never reaches the original subagent
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("options", [
+    ["--subagent-exit", "crash"],
+    ["--subagent-exit", "complete"],
+    ["--subagent-exit", "keep-alive", "--replace-text", "NEW REPORT"],
+])
+def test_fork_at_a_report_stops_when_the_subagent_cannot_be_copied(base_dir, monkeypatch, capsys, options):
+    """With nothing to copy, the change went to the original: its catalog row was killed and its transcript cut."""
+    (base_dir / "conversations" / f"{CHILD}.db").unlink()
+    before = originals(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, "15", *options, "--fork", "b")
+
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == error_box(
+        f"Cannot fork at this report: the database of subagent {CHILD} is missing, so the fork could not have its own copy."
+    )
+    assert_no_fork_exists_except_missing_child(base_dir)
+    assert originals(base_dir) == before
+
+
+def assert_no_fork_exists_except_missing_child(base: Path) -> None:
+    assert [path.stem for path in (base / "conversations").iterdir()] == [CONV]
+    assert sorted(path.name for path in (base / "brain").iterdir()) == [CONV, CHILD]
+    assert lineage(base) == []
+
+
+def test_fork_still_drops_a_subagent_it_does_not_need_and_cannot_copy(base_dir, monkeypatch):
+    """Only the subagent being changed is required: others with no database are simply left out of the fork."""
+    (base_dir / "conversations" / f"{CHILD}.db").unlink()
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-text", "NEW TEXT", "--fork", "b")
+
+    assert len(lineage(base_dir)) == 1

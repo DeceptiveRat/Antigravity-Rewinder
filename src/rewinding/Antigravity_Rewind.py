@@ -5290,6 +5290,11 @@ def clone_kept_subagents(base_dir: str, source_id: str, new_parent_id: str, last
         child_db = os.path.join(base_dir, "conversations", f"{child_id}.db")
         kept = (last_kept_step is None or child_id == required_id
                 or any(child_id.encode("utf-8") in payload for payload in kept_payloads))
+        if child_id == required_id and not os.path.exists(child_db):
+            # With no copy, the intervention that follows would change the original subagent
+            raise ValueError(
+                f"Cannot fork at this report: the database of subagent {child_id} is missing, so the fork could not have its own copy."
+            )
         if not kept or not os.path.exists(child_db):
             descriptor = os.path.join(base_dir, "brain", new_parent_id, ".system_generated", "subagents", f"{child_id}.json")
             if os.path.exists(descriptor):
