@@ -7,6 +7,7 @@ files and databases a command leaves behind.
 
 import json
 import os
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,6 @@ from rewinding.Antigravity_Rewind import (
     build_inquiry_answer,
     count_or_truncate_chunks,
     detect_step_info,
-    extract_subagent_msg_info,
     replace_in_result,
 )
 from rewinding.interceptor import KickstartStripper
@@ -213,7 +213,7 @@ def test_dry_run_with_split_chunks_reports_counts_and_writes_nothing(base_dir, m
     expected_kept = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in long_session_records(base_dir)[:19]).encode()
     file_count = len(list(chunk_folder(base_dir).glob("*.jsonl")))
     kept_files = (len(expected_kept) + CHUNK_SIZE - 1) // CHUNK_SIZE
-    assert f"[DRY-RUN] Chunks to truncate: 6 lines (delete {(file_count - kept_files) * 2} empty chunk files)" in capsys.readouterr().out
+    assert f"[DRY-RUN] Chunks to truncate: 6 lines (delete {(file_count - kept_files) * 2} empty chunk files)" in capsys.readouterr().out.splitlines()
 
 
 @given(
@@ -238,6 +238,24 @@ def test_truncating_chunks_keeps_exactly_the_earlier_lines(tmp_path_factory, siz
     assert b"".join(path.read_bytes() for path in files) == kept
     assert [path.stat().st_size for path in files[:-1]] == [CHUNK_SIZE] * (len(files) - 1)
     assert deleted == (len(data) + CHUNK_SIZE - 1) // CHUNK_SIZE - (len(kept) + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+
+def test_rewriting_chunks_uses_memory_in_proportion_to_the_transcript(tmp_path):
+    """The whole folder is read at once, so its peak memory has to stay a small multiple of the transcript."""
+    folder = tmp_path / "chunks"
+    folder.mkdir()
+    lines = [json.dumps({"step_index": i, "text": "가" * 2000}, ensure_ascii=False) + "\n" for i in range(800)]
+    data = "".join(lines).encode("utf-8")
+    for number, start in enumerate(range(0, len(data), CHUNK_SIZE)):
+        (folder / f"{number:08d}.jsonl").write_bytes(data[start:start + CHUNK_SIZE])
+
+    tracemalloc.start()
+    count_or_truncate_chunks(str(folder), 400, dry_run=False)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert peak < 8 * len(data)
+    assert b"".join(path.read_bytes() for path in sorted(folder.glob("*.jsonl"))) == "".join(lines[:400]).encode("utf-8")
 
 
 @pytest.mark.parametrize("damage", [b"\xff\xfe broken", b"\x00\x00", b"", b"   \n", b"{\"step_index\": "])
@@ -398,7 +416,7 @@ def test_text_found_only_outside_the_result_is_reported_as_not_found(base_dir, m
         run_cli(monkeypatch, base_dir, "1", "--replace-old", search, "--replace-new", "CHANGED")
 
     assert exit_info.value.code == 1
-    assert f"Could not find '{search}' in step 2, so the replacement was not applied. Nothing was changed." in capsys.readouterr().err
+    assert capsys.readouterr().err == error_box(f"Could not find '{search}' in step 2, so the replacement was not applied. Nothing was changed.")
     assert snapshot(base_dir) == before
 
 
@@ -431,7 +449,9 @@ def test_result_without_stored_text_is_refused_and_keeps_its_structure(base_dir,
         run_cli(monkeypatch, base_dir, "1", "--replace-text", "NEW TEXT")
 
     assert exit_info.value.code == 1
-    assert "Could not find 'text only in the transcript' in step 2" in capsys.readouterr().err
+    assert capsys.readouterr().err == error_box(
+        "Could not find 'text only in the transcript' in step 2, so the replacement was not applied. Nothing was changed."
+    )
     assert snapshot(base_dir) == before
 
 
@@ -583,7 +603,7 @@ def test_damaged_child_database_stops_before_anything_changes(base_dir, monkeypa
         run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "crash")
 
     assert exit_info.value.code == 1
-    assert "Error: file is not a database" in capsys.readouterr().err
+    assert capsys.readouterr().err == error_box("file is not a database")
     assert snapshot(base_dir) == before
 
 
@@ -613,7 +633,7 @@ def test_report_search_text_outside_the_report_is_not_found(base_dir, monkeypatc
         run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "keep-alive", "--replace-old", search, "--replace-new", "CHANGED")
 
     assert exit_info.value.code == 1
-    assert f"Target string '{search}' not found in Step {REPORT_STEP} subagent report." in capsys.readouterr().err
+    assert capsys.readouterr().err == error_box(f"Target string '{search}' not found in Step {REPORT_STEP} subagent report.")
     assert snapshot(base_dir) == before
 
 
@@ -672,8 +692,42 @@ def test_failed_task_is_not_rewritten_as_a_success(base_dir, monkeypatch, capsys
 # Task-finished messages say what was asked, and keep the rest of the step
 # ---------------------------------------------------------------------------
 
+def read_fields(data: bytes) -> dict[int, bytes]:
+    """A minimal Protobuf reader, independent of the code under test. Keeps the last value of each field."""
+    fields = {}
+    position = 0
+
+    def read_varint() -> int:
+        nonlocal position
+        value = shift = 0
+        while True:
+            byte = data[position]
+            position += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return value
+
+    while position < len(data):
+        tag = read_varint()
+        if tag & 7 == 2:
+            length = read_varint()
+            fields[tag >> 3] = data[position:position + length]
+            position += length
+        else:
+            fields[tag >> 3] = read_varint()
+    return fields
+
+
+def message_parts(payload: bytes) -> tuple[bytes, bytes, str]:
+    """Returns the ID, sender and text held at field 114.4 of a stored message."""
+    message = read_fields(read_fields(payload)[114])[4]
+    parts = read_fields(message)
+    return parts[1], parts[3], parts[4].decode("utf-8")
+
+
 def notification_text(base: Path, step: int) -> str:
-    return extract_subagent_msg_info(stored_payload(base, step))[2]
+    return message_parts(stored_payload(base, step))[2]
 
 
 @pytest.mark.parametrize("options, expected", [
@@ -736,9 +790,9 @@ def test_notification_without_stored_text_is_still_written(base_dir, monkeypatch
 
     run_cli(monkeypatch, base_dir, "17", "--replace-text", "NEW MESSAGE")
 
-    message_id, sender, text = extract_subagent_msg_info(stored_payload(base_dir, 17))
-    assert (sender, text) == (f"{CONV}/task-4", "NEW MESSAGE")
-    assert message_id is not None
+    message_id, sender, text = message_parts(stored_payload(base_dir, 17))
+    assert (sender, text) == (f"{CONV}/task-4".encode(), "NEW MESSAGE")
+    assert len(message_id) == 36
 
 
 # ---------------------------------------------------------------------------
@@ -1320,7 +1374,7 @@ def test_report_can_change_when_the_child_has_no_database(base_dir, monkeypatch)
 
     run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "keep-alive", "--replace-text", "NEW REPORT")
 
-    assert extract_subagent_msg_info(stored_payload(base_dir, REPORT_STEP))[2] == "NEW REPORT"
+    assert notification_text(base_dir, REPORT_STEP) == "NEW REPORT"
 
 
 def test_child_step_from_the_message_file_is_still_used(base_dir, monkeypatch):

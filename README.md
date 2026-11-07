@@ -103,16 +103,16 @@ To replace the whole result:
 ```bash
 python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> 3 --replace-text "new result"
 ```
-If the text to find is not there, or the new text is empty, the command stops with an error and changes nothing.
+A search looks only in the result's text, not in the step's metadata or the tool call's arguments. If the text to find is not there, or the new text is empty, the command stops with an error and changes nothing.
 
 A step can make several tool calls at once, with one result step per call. An intervention changes the first call's result and keeps the others.
 
 ### Fork at a Step
-A fork takes the same options as a change in place. The original conversation is not changed:
+A fork takes the same options as a change in place, except `--out-dir`, because a fork is always created beside the original. The original conversation is not changed:
 ```bash
 python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> 3 --replace-text "new result" --fork my-branch
 ```
-The fork gets a new conversation ID, which replaces the original's ID throughout its data. It also gets its own copy of every subagent its remaining steps refer to, so changing or resuming the fork cannot affect the original subagents. If a fork fails, everything it created is removed.
+The fork gets a new conversation ID, which replaces the original's ID throughout its data. It also gets its own copy of every subagent its remaining steps refer to, so changing or resuming the fork cannot affect the original subagents. A fork at a subagent's report stops with an error if that subagent's database is missing. If a fork fails, everything it created is removed.
 
 To see forks and their lineage:
 ```bash
@@ -167,6 +167,9 @@ A copy made with `--out-dir` has to be moved to that layout before it can be res
 - Workspace files are not restored. Only the agent's recorded state changes, so files it wrote stay on disk.
 - Only the first call's result can be changed when a step makes several calls.
 - Results of subagent management tools such as invoke_subagent cannot be changed.
+- Many real results keep no text in the database, for example about two in three `read_file` results. These cannot be changed, and the command stops with an error.
+- `--replace-web-content` only writes `content.md`. The stored result keeps the original page unless `--replace-text` is also given.
+- `src/rewinding/interceptor.py` removes any user turn that contains the token, including a real prompt that quotes it.
 - Step types and Protobuf field numbers are reverse-engineered, so an Antigravity update could change them.
 
 ## Optional ACTF Parser
