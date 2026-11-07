@@ -1540,15 +1540,14 @@ def test_cut_before_the_spawn_removes_the_subagents_record(base_dir, monkeypatch
     assert "  - Removed 1 record(s) of subagents spawned after this point." in capsys.readouterr().out.splitlines()
 
 
-@pytest.mark.parametrize("args", [
-    pytest.param(["19"], id="rewind-later"),
-    pytest.param(["16"], id="rewind-to-next-step"),
-    pytest.param(["13", "--before-response"], id="rewind-to-the-call-at-14"),
-    pytest.param(["17", "--replace-text", "NEW"], id="notification"),
-    pytest.param(["15", "--subagent-exit", "keep-alive", "--replace-text", "NEW"], id="the-report-itself"),
+@pytest.mark.parametrize("args, spawn", [
+    pytest.param(["19"], 14, id="rewind-later"),
+    pytest.param(["16"], 14, id="rewind-to-next-step"),
+    pytest.param(["13", "--before-response"], 12, id="spawned-at-the-last-kept-step"),
+    pytest.param(["17", "--replace-text", "NEW"], 14, id="notification"),
+    pytest.param(["15", "--subagent-exit", "keep-alive", "--replace-text", "NEW"], 14, id="the-report-itself"),
 ])
-def test_cut_after_the_spawn_keeps_the_subagents_record(base_dir, monkeypatch, args):
-    spawn = 12 if args[0] == "13" else 14
+def test_cut_after_the_spawn_keeps_the_subagents_record(base_dir, monkeypatch, args, spawn):
     path = write_descriptor(base_dir, CHILD, descriptor(spawn))
     expected = descriptor(spawn)
 
