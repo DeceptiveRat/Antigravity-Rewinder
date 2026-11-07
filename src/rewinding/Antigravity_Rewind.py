@@ -734,7 +734,11 @@ def show_step(base_dir: str, conv_id: str, target_step: int):
         print(f"Paired Call:  Step {parent_step} ({p_tool or p_cat})")
     elif category.startswith("tool_call_"):
         next_step = target_step + 1
-        n_cat, _ = detect_step_info(base_dir, conv_id, next_step)
+        try:
+            n_cat, _ = detect_step_info(base_dir, conv_id, next_step)
+        except ValueError:
+            # A tool call can be the last step, with its result not written yet
+            n_cat = None
         if n_cat == "tool_result":
             print(f"Paired Res:   Step {next_step} (tool_result)")
 

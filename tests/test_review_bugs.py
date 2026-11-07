@@ -36,6 +36,7 @@ from test_forks import (
     originals,
     run_cli,
     run_real_tui,
+    run_state,
     snapshot,
     system_message_payload,
     task_logs,
@@ -1569,3 +1570,19 @@ def test_web_content_note_is_absent_when_the_result_also_changes(base_dir, monke
     assert stored_payload(base_dir, 8) == shape_plain("NEW RESULT")
     assert shown_texts(base_dir, 8) == [TIMESTAMPS + "NEW RESULT"] * 4
     assert WEB_NOTE not in capsys.readouterr().out.splitlines()
+
+
+# ---------------------------------------------------------------------------
+# --show-step on a tool call that has no result yet
+# ---------------------------------------------------------------------------
+
+def test_show_step_on_a_last_step_tool_call(base_dir, monkeypatch, capsys):
+    """Looking up the result of the last step raised an error that ended in a traceback."""
+    with open_db(base_dir / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("DELETE FROM steps WHERE idx > 1")
+
+    run_cli(monkeypatch, base_dir, "--show-step", "1")
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "Category:     tool_call_read" in lines
+    assert [line for line in lines if line.startswith("Paired Res:")] == []
