@@ -11,6 +11,7 @@ Synchronized with the ACTF pipeline (cli.py) to parse and list all event types
 import argparse
 import contextlib
 import glob
+import io
 import json
 import os
 import pathlib
@@ -27,6 +28,9 @@ from itertools import groupby
 # Step types used by Antigravity trajectory engine
 STEP_TYPE_USER_INPUT = 14
 STEP_TYPE_MODEL_RESPONSE = 15
+
+# Size at which Antigravity cuts a transcript into chunk files
+CHUNK_SIZE = 102400
 
 # Path resolution relative to repository structure
 REAL_FILE = os.path.realpath(__file__)
@@ -854,26 +858,69 @@ def show_step(base_dir: str, conv_id: str, target_step: int):
     print("=" * 80 + "\n")
 
 
+def truncate_lines(lines, target_step: int) -> tuple[list[str], int]:
+    """Keeps only records with step_index < target_step. Returns the kept lines and the number removed."""
+    kept = []
+    removed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+            idx = data.get("step_index")
+            if idx is not None and idx >= target_step:
+                removed += 1
+                continue
+            kept.append(line if line.endswith("\n") else line + "\n")
+        except Exception:
+            kept.append(line if line.endswith("\n") else line + "\n")
+    return kept, removed
+
+
+def modify_or_truncate_lines(lines, cutoff_step: int, modify_step: int = None, old_str: str = None,
+                             new_str: str = None, dry_run: bool = False) -> tuple[list[str], int]:
+    """
+    Keeps lines with step_index <= cutoff_step, removing any lines with step_index > cutoff_step.
+    If modify_step is specified, updates content for that step using update_transcript_content.
+    """
+    kept = []
+    removed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+            idx = data.get("step_index")
+            if idx is not None and idx > cutoff_step:
+                removed += 1
+                continue
+            if idx is not None and idx == modify_step and not dry_run:
+                content = data.get("content", "")
+                data["content"] = update_transcript_content(content, old_str, new_str or "")
+                if data.get("status") == "RUNNING":
+                    data["status"] = "DONE"
+                if "completed_at" not in data or not data.get("completed_at"):
+                    data["completed_at"] = data.get("created_at")
+                if "tool_calls" in data and isinstance(data["tool_calls"], list) and old_str:
+                    for tc in data["tool_calls"]:
+                        args = tc.get("args", {})
+                        if isinstance(args, dict):
+                            for k, v in args.items():
+                                if isinstance(v, str) and old_str in v:
+                                    args[k] = v.replace(old_str, new_str or "")
+                line = json.dumps(data, ensure_ascii=False) + "\n"
+            kept.append(line if line.endswith("\n") else line + "\n")
+        except Exception:
+            kept.append(line if line.endswith("\n") else line + "\n")
+    return kept, removed
+
+
 def count_or_truncate_jsonl(path: str, target_step: int, dry_run: bool = False) -> int:
     """Keeps only records with step_index < target_step. Returns number of removed lines."""
     if not os.path.exists(path):
         return 0
-    kept = []
-    removed = 0
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                data = json.loads(line)
-                idx = data.get("step_index")
-                if idx is not None and idx >= target_step:
-                    removed += 1
-                    continue
-                kept.append(line if line.endswith("\n") else line + "\n")
-            except Exception:
-                kept.append(line if line.endswith("\n") else line + "\n")
-
+        kept, removed = truncate_lines(f, target_step)
     if not dry_run:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
@@ -882,91 +929,62 @@ def count_or_truncate_jsonl(path: str, target_step: int, dry_run: bool = False) 
 
 def modify_or_truncate_jsonl(path: str, cutoff_step: int, modify_step: int = None,
                               old_str: str = None, new_str: str = None, dry_run: bool = False) -> int:
-    """
-    Keeps lines with step_index <= cutoff_step, truncating any lines with step_index > cutoff_step.
-    If modify_step is specified, updates content for that step using update_transcript_content.
-    """
+    """Applies modify_or_truncate_lines to a transcript file. Returns number of removed lines."""
     if not os.path.exists(path):
         return 0
-    kept = []
-    removed = 0
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                data = json.loads(line)
-                idx = data.get("step_index")
-                if idx is not None and idx > cutoff_step:
-                    removed += 1
-                    continue
-                if idx is not None and idx == modify_step and not dry_run:
-                    content = data.get("content", "")
-                    data["content"] = update_transcript_content(content, old_str, new_str or "")
-                    if data.get("status") == "RUNNING":
-                        data["status"] = "DONE"
-                    if "completed_at" not in data or not data.get("completed_at"):
-                        data["completed_at"] = data.get("created_at")
-                    if "tool_calls" in data and isinstance(data["tool_calls"], list) and old_str:
-                        for tc in data["tool_calls"]:
-                            args = tc.get("args", {})
-                            if isinstance(args, dict):
-                                for k, v in args.items():
-                                    if isinstance(v, str) and old_str in v:
-                                        args[k] = v.replace(old_str, new_str or "")
-                    line = json.dumps(data, ensure_ascii=False) + "\n"
-                kept.append(line if line.endswith("\n") else line + "\n")
-            except Exception:
-                kept.append(line if line.endswith("\n") else line + "\n")
-
+        kept, removed = modify_or_truncate_lines(f, cutoff_step, modify_step, old_str, new_str, dry_run)
     if not dry_run:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
     return removed
 
 
-def count_or_truncate_chunks(chunks_dir: str, target_step: int, dry_run: bool = False) -> tuple[int, int]:
-    """Truncates chunk files. Returns (removed_lines, deleted_files)."""
+def rewrite_chunks(chunks_dir: str, edit_lines, dry_run: bool = False) -> tuple[int, int]:
+    """
+    Applies edit_lines to a chunk folder. Antigravity cuts a transcript into pieces of exactly CHUNK_SIZE bytes,
+    so a piece can start in the middle of a line or even of a character. Only the whole folder, read in order,
+    is a list of lines, and it is written back cut the same way. Returns (removed_lines, deleted_files).
+    """
     if not os.path.isdir(chunks_dir):
         return 0, 0
-    total_removed = 0
-    deleted_files = 0
-    for chunk_file in glob.glob(os.path.join(chunks_dir, "*.jsonl")):
-        rem = count_or_truncate_jsonl(chunk_file, target_step, dry_run=dry_run)
-        total_removed += rem
-        if not dry_run:
-            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == 0:
+    files = sorted(glob.glob(os.path.join(chunks_dir, "*.jsonl")))
+    if not files:
+        return 0, 0
+    data = bytearray()
+    for chunk_file in files:
+        with open(chunk_file, "rb") as f:
+            data += f.read()
+    # surrogateescape carries damaged bytes through unchanged, as they may be a line still being written
+    text = bytes(data).decode("utf-8", errors="surrogateescape")
+    kept, removed = edit_lines(io.StringIO(text, newline="\n"))
+    new_data = "".join(kept).encode("utf-8", errors="surrogateescape")
+    pieces = [new_data[start:start + CHUNK_SIZE] for start in range(0, len(new_data), CHUNK_SIZE)]
+    deleted_files = max(0, len(files) - len(pieces))
+    if not dry_run and new_data != data:
+        names = [f"{number:08d}.jsonl" for number in range(len(pieces))]
+        for name, piece in zip(names, pieces):
+            with open(os.path.join(chunks_dir, name), "wb") as f:
+                f.write(piece)
+        for chunk_file in files:
+            if os.path.basename(chunk_file) not in names:
                 os.remove(chunk_file)
-                deleted_files += 1
-        else:
-            with open(chunk_file, "r", encoding="utf-8") as cf:
-                lines_in_chunk = sum(1 for l in cf if l.strip())
-            if lines_in_chunk > 0 and rem >= lines_in_chunk:
-                deleted_files += 1
-    return total_removed, deleted_files
+    return removed, deleted_files
+
+
+def count_or_truncate_chunks(chunks_dir: str, target_step: int, dry_run: bool = False) -> tuple[int, int]:
+    """Truncates chunk files. Returns (removed_lines, deleted_files)."""
+    return rewrite_chunks(chunks_dir, lambda lines: truncate_lines(lines, target_step), dry_run)
 
 
 def modify_or_truncate_chunks(chunks_dir: str, cutoff_step: int, modify_step: int = None,
                               old_str: str = None, new_str: str = None, dry_run: bool = False) -> tuple[int, int]:
     """Truncates chunk files keeping steps <= cutoff_step. Returns (removed_lines, deleted_files)."""
-    if not os.path.isdir(chunks_dir):
-        return 0, 0
-    total_removed = 0
-    deleted_files = 0
-    for chunk_file in glob.glob(os.path.join(chunks_dir, "*.jsonl")):
-        rem = modify_or_truncate_jsonl(chunk_file, cutoff_step, modify_step=modify_step,
-                                       old_str=old_str, new_str=new_str, dry_run=dry_run)
-        total_removed += rem
-        if not dry_run:
-            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == 0:
-                os.remove(chunk_file)
-                deleted_files += 1
-        else:
-            with open(chunk_file, "r", encoding="utf-8") as cf:
-                lines_in_chunk = sum(1 for l in cf if l.strip())
-            if lines_in_chunk > 0 and rem >= lines_in_chunk:
-                deleted_files += 1
-    return total_removed, deleted_files
+    return rewrite_chunks(
+        chunks_dir,
+        lambda lines: modify_or_truncate_lines(lines, cutoff_step, modify_step, old_str, new_str, dry_run),
+        dry_run
+    )
 
 
 def count_or_filter_history(history_path: str, conv_id: str, cutoff_ms: int, rewound_prompts: set, dry_run: bool = False) -> int:
@@ -4613,29 +4631,34 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
         return task_id
 
 
-def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = False) -> int:
+def remove_step_and_shift_lines(lines, remove_step: int) -> tuple[list[str], int]:
     """Removes the line for remove_step and shifts step_index by -1 for steps > remove_step."""
-    if not os.path.exists(path):
-        return 0
     kept = []
     removed = 0
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+            idx = data.get("step_index")
+            if idx is not None and idx == remove_step:
+                removed += 1
                 continue
-            try:
-                data = json.loads(line)
-                idx = data.get("step_index")
-                if idx is not None and idx == remove_step:
-                    removed += 1
-                    continue
-                if idx is not None and idx > remove_step:
-                    data["step_index"] = idx - 1
-                    line = json.dumps(data, ensure_ascii=False) + "\n"
-                kept.append(line if line.endswith("\n") else line + "\n")
-            except Exception:
-                kept.append(line if line.endswith("\n") else line + "\n")
+            if idx is not None and idx > remove_step:
+                data["step_index"] = idx - 1
+                line = json.dumps(data, ensure_ascii=False) + "\n"
+            kept.append(line if line.endswith("\n") else line + "\n")
+        except Exception:
+            kept.append(line if line.endswith("\n") else line + "\n")
+    return kept, removed
 
+
+def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = False) -> int:
+    """Applies remove_step_and_shift_lines to a transcript file. Returns number of removed lines."""
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        kept, removed = remove_step_and_shift_lines(f, remove_step)
     if not dry_run and removed > 0:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
@@ -4644,23 +4667,7 @@ def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = Fal
 
 def remove_step_and_shift_chunks(chunks_dir: str, remove_step: int, dry_run: bool = False) -> tuple[int, int]:
     """Applies step removal and index shift across chunk files."""
-    if not os.path.isdir(chunks_dir):
-        return 0, 0
-    total_removed = 0
-    deleted_files = 0
-    for chunk_file in glob.glob(os.path.join(chunks_dir, "*.jsonl")):
-        rem = remove_step_and_shift_jsonl(chunk_file, remove_step, dry_run=dry_run)
-        total_removed += rem
-        if not dry_run:
-            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == 0:
-                os.remove(chunk_file)
-                deleted_files += 1
-        else:
-            with open(chunk_file, "r", encoding="utf-8") as cf:
-                lines_in_chunk = sum(1 for l in cf if l.strip())
-            if lines_in_chunk > 0 and rem >= lines_in_chunk:
-                deleted_files += 1
-    return total_removed, deleted_files
+    return rewrite_chunks(chunks_dir, lambda lines: remove_step_and_shift_lines(lines, remove_step), dry_run)
 
 
 def execute_kickstart_cleanup(
