@@ -4516,14 +4516,14 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
             if ts_low in ("cancelled", "canceled"):
                 new_content = f'Task id "{tid_label}" has been cancelled by the user.'
-            elif ts_low in ("failed", "error") or exit_code != 0:
-                new_content = f'Task id "{tid_label}" finished with result:\n\nThe command exited with code {exit_code}.'
-                if output_text is not None and output_text.strip():
-                    new_content += f"\nError:\n{output_text}"
             elif ts_low == "running":
                 new_content = f'Task id "{tid_label}" is currently running.'
                 if output_text is not None and output_text.strip():
                     new_content += f"\nOutput:\n{output_text}"
+            elif ts_low in ("failed", "error") or exit_code != 0:
+                new_content = f'Task id "{tid_label}" finished with result:\n\nThe command exited with code {exit_code}.'
+                if output_text is not None and output_text.strip():
+                    new_content += f"\nError:\n{output_text}"
             else:
                 new_content = f'Task id "{tid_label}" finished with result:\n\nThe command exited with code {exit_code}.'
                 if output_text is not None and output_text.strip():

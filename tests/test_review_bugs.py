@@ -11,10 +11,16 @@ from pathlib import Path
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
-from rewinding.Antigravity_Rewind import count_or_truncate_chunks, detect_step_info, replace_in_result
+from rewinding.Antigravity_Rewind import (
+    count_or_truncate_chunks,
+    detect_step_info,
+    extract_subagent_msg_info,
+    replace_in_result,
+)
 from test_forks import (
     CHILD,
     CONV,
+    add_task_logs,
     base_dir,  # noqa: F401 (a fixture)
     block_network,  # noqa: F401 (a fixture, active for every test here)
     bytes_field,
@@ -649,3 +655,27 @@ def test_failed_task_is_not_rewritten_as_a_success(base_dir, monkeypatch, capsys
         run_cli(monkeypatch, base_dir, "17", "--replace-old", "foo")
 
     assert stored_payload(base_dir, 17) == original
+
+
+# ---------------------------------------------------------------------------
+# Task-finished messages say what was asked, and keep the rest of the step
+# ---------------------------------------------------------------------------
+
+def notification_text(base: Path, step: int) -> str:
+    return extract_subagent_msg_info(stored_payload(base, step))[2]
+
+
+@pytest.mark.parametrize("options, expected", [
+    (["--task-status", "running"], f'Task id "{CONV}/task-4" is currently running.'),
+    (["--task-status", "RUNNING"], f'Task id "{CONV}/task-4" is currently running.'),
+    (["--task-status", "running", "--task-exit-code", "3"], f'Task id "{CONV}/task-4" is currently running.'),
+    (["--task-status", "finished"], f'Task id "{CONV}/task-4" finished with result:\n\nThe command exited with code 0.'),
+    (["--task-status", "failed"], f'Task id "{CONV}/task-4" finished with result:\n\nThe command exited with code 1.'),
+    (["--task-status", "failed", "--task-exit-code", "5"], f'Task id "{CONV}/task-4" finished with result:\n\nThe command exited with code 5.'),
+    (["--task-exit-code", "0"], f'Task id "{CONV}/task-4" finished with result:\n\nThe command exited with code 0.'),
+    (["--task-status", "cancelled"], f'Task id "{CONV}/task-4" has been cancelled by the user.'),
+])
+def test_task_status_is_worded_as_asked(base_dir, monkeypatch, options, expected):
+    """"running" used to be written as a task that had exited with code 1."""
+    run_cli(monkeypatch, base_dir, "17", *options)
+    assert notification_text(base_dir, 17) == expected
