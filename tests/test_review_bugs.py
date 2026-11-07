@@ -17,6 +17,7 @@ from rewinding.Antigravity_Rewind import (
     extract_subagent_msg_info,
     replace_in_result,
 )
+from rewinding.interceptor import KickstartStripper
 from test_forks import (
     CHILD,
     CONV,
@@ -849,3 +850,94 @@ def test_simulated_error_on_a_launch_is_shown_as_a_finished_result(base_dir, mon
     created = "2026-10-19T05:10:00Z"
     finished = f"Created At: {created}\nCompleted At: {created}\n\nThe command exited with code 1.\n"
     assert shown_texts(base_dir, 4) == [finished] * 4
+
+
+# ---------------------------------------------------------------------------
+# The kickstart proxy removes the kickstart, and leaves real content alone
+# ---------------------------------------------------------------------------
+
+TOKEN = "__AGY_KICKSTART__"
+NOTICE = "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Notice] stopped\n</SYSTEM_MESSAGE>"
+
+
+class ProxyRequest:
+    method = "POST"
+    path = "/v1/models/gemini:generateContent"
+
+    def __init__(self, body: dict):
+        self.body = json.dumps(body)
+
+    def get_text(self) -> str:
+        return self.body
+
+    def set_text(self, text: str) -> None:
+        self.body = text
+
+
+class ProxyFlow:
+    """What mitmproxy hands the addon: a request that can be read and rewritten."""
+
+    def __init__(self, contents: list):
+        self.request = ProxyRequest({"contents": contents})
+
+
+def text_turn(role: str, text: str) -> dict:
+    return {"role": role, "parts": [{"text": text}]}
+
+
+def after_proxy(monkeypatch, tmp_path, contents: list) -> list:
+    """Runs the addon with no token file in the way, and returns the turns it would send on."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("AGY_KICKSTART_TOKEN", raising=False)
+    flow = ProxyFlow(contents)
+    KickstartStripper().request(flow)
+    return json.loads(flow.request.get_text())["contents"]
+
+
+def test_proxy_keeps_a_model_reply_that_quotes_the_token(monkeypatch, tmp_path):
+    """Any role counted, so the model's own answer was dropped from what it was told it had said."""
+    turns = [text_turn("user", "What is the phrase?"), text_turn("model", f"The phrase is {TOKEN}."), text_turn("user", "Thanks.")]
+    assert after_proxy(monkeypatch, tmp_path, turns) == turns
+
+
+def test_proxy_removes_every_kickstart_in_the_history(monkeypatch, tmp_path):
+    """The search stopped at the newest one, so an older kickstart reached the model."""
+    turns = [
+        text_turn("user", "Real task"),
+        text_turn("user", TOKEN),
+        text_turn("model", "First answer"),
+        text_turn("user", TOKEN),
+        text_turn("model", "Second answer"),
+    ]
+    assert after_proxy(monkeypatch, tmp_path, turns) == [turns[0], turns[2], turns[4]]
+
+
+@pytest.mark.parametrize("prompt", [
+    "What does [Notice] mean in this log?",
+    "Why is <SYSTEM_MESSAGE> in the transcript?",
+    "Explain this line: [Message] timestamp=2026-10-19",
+])
+def test_proxy_keeps_a_real_prompt_that_mentions_a_marker(monkeypatch, tmp_path, prompt):
+    """A marker anywhere in the next turn marked it as a system notice, which deleted the prompt."""
+    turns = [text_turn("user", "Real task"), text_turn("user", TOKEN), text_turn("user", prompt)]
+    assert after_proxy(monkeypatch, tmp_path, turns) == [turns[0], turns[2]]
+
+
+@pytest.mark.parametrize("notice", [NOTICE, "<SYSTEM_MESSAGE>\n[Notice] stopped", "[Notice] stopped", "  [Message] timestamp=2026", "\n" + NOTICE])
+def test_proxy_removes_the_system_notice_after_a_kickstart(monkeypatch, tmp_path, notice):
+    """Every system message in the real sessions checked starts with the first of these."""
+    turns = [text_turn("user", "Real task"), text_turn("user", TOKEN), text_turn("user", notice), text_turn("model", "Answer")]
+    assert after_proxy(monkeypatch, tmp_path, turns) == [turns[0], turns[3]]
+
+
+@pytest.mark.parametrize("contents", [
+    pytest.param([], id="empty"),
+    pytest.param([{"role": "user", "parts": []}], id="no-parts"),
+    pytest.param([{"role": "user"}], id="missing-parts"),
+    pytest.param([{"parts": [{"text": "no role"}]}], id="no-role"),
+    pytest.param([{"role": "user", "parts": [{"functionResponse": {"name": "x"}}]}], id="tool-result"),
+    pytest.param([{"role": "user", "parts": [{"text": ""}]}], id="empty-text"),
+    pytest.param([{"role": "user", "parts": [{"text": "\x00"}]}], id="null-byte"),
+])
+def test_proxy_passes_requests_without_a_kickstart_through_unchanged(monkeypatch, tmp_path, contents):
+    assert after_proxy(monkeypatch, tmp_path, contents) == contents
