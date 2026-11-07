@@ -25,6 +25,9 @@ clean_preview = rewind_mod.clean_preview
 STEP_TYPE_USER_INPUT = rewind_mod.STEP_TYPE_USER_INPUT
 STEP_TYPE_MODEL_RESPONSE = rewind_mod.STEP_TYPE_MODEL_RESPONSE
 
+# The fork key collects no intervention content, so it can only fork these steps correctly
+FORKABLE_CATEGORIES = ("prompt", "model_response")
+
 
 @dataclass
 class StepItem:
@@ -340,11 +343,24 @@ class RewindTUIApp:
             self.status_msg = msg
             return False, msg
 
+    def _fork_refusal(self, step: StepItem, arm_running: bool) -> str | None:
+        """Explains why the selected step cannot be forked, or returns None if it can."""
+        if step.category in FORKABLE_CATEGORIES:
+            return None
+        if arm_running and step.category.startswith("tool_call_"):
+            return None
+        return f"Fork works only on prompts and model responses; step {step.idx} is {step.category}."
+
     def execute_action_fork(self, branch_name: str = "branch", arm_running: bool = False) -> tuple[bool, str, str | None]:
         """Performs non-destructive fork action at the currently selected step."""
         step = self.get_selected_step()
         if not step:
             return False, "No step selected.", None
+
+        refusal = self._fork_refusal(step, arm_running)
+        if refusal:
+            self.status_msg = refusal
+            return False, refusal, None
 
         if execute_fork is None:
             return False, "execute_fork function is not available.", None
@@ -665,6 +681,11 @@ class RewindTUIApp:
         """Input dialog and confirmation before executing conversation fork."""
         step = self.get_selected_step()
         if not step:
+            return
+
+        refusal = self._fork_refusal(step, arm_running)
+        if refusal:
+            self.status_msg = refusal
             return
 
         branch_name = self._show_input_dialog(f"Fork @ Step {step.idx} - Branch Name (default: 'branch'):")

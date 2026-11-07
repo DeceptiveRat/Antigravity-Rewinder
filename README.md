@@ -33,7 +33,7 @@ Requires Python 3.10 or higher. Uses standard library modules only for core oper
 
 For running tests:
 ```bash
-pip install pytest
+pip install pytest hypothesis
 ```
 
 ## Basic Usage

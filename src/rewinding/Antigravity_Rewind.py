@@ -4778,6 +4778,13 @@ def setup_fork_destination(
             s_conn.commit()
 
 
+FORK_AT_SUBAGENT_REPORT_ERROR = (
+    "Forking at a subagent report is not supported yet. The fork would share the child "
+    "subagent conversation with its parent, so the intervention would permanently change "
+    "the child that the parent still points to. Use --out-dir to work on a full copy instead."
+)
+
+
 def execute_fork(
     base_dir: str,
     parent_conv_id: str,
@@ -4794,6 +4801,12 @@ def execute_fork(
     Parent conversation state remains completely untouched.
     Returns the newly created fork conversation ID.
     """
+    # execute_subagent_intervene edits the child conversation by ID, and a fork does not
+    # copy the child, so it would change the parent's child. The subagent_report branches
+    # below stay in place for when forks clone the child.
+    if category == "subagent_report":
+        raise ValueError(FORK_AT_SUBAGENT_REPORT_ERROR)
+
     fork_cid = fork_conv_id or str(uuid.uuid4())
     kwargs = dict(intervention_kwargs or {})
 
@@ -5133,7 +5146,7 @@ def main():
         nargs="?",
         const="branch",
         default=None,
-        help="Create a non-destructive conversation fork/branch at the target step instead of modifying the parent conversation in place. Optional value specifies branch name/label (default: 'branch')."
+        help="Create a non-destructive conversation fork/branch at the target step instead of modifying the parent conversation in place. Optional value specifies branch name/label (default: 'branch'). Not available at subagent report steps."
     )
     parser.add_argument(
         "--tree", "-t", "--lineage",
@@ -5256,6 +5269,11 @@ def main():
                     f"Support for {desc} is not yet implemented."
                 )
                 print(error_msg, file=sys.stderr)
+                sys.exit(1)
+
+            # Checked before the task-log options, which would not help a fork that cannot happen
+            if getattr(args, "fork", None) is not None and category == "subagent_report":
+                print_standout_box([f"Error: {FORK_AT_SUBAGENT_REPORT_ERROR}"], border_char="!", file=sys.stderr)
                 sys.exit(1)
 
             # Strict option validation per category and tool type
