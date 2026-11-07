@@ -2571,6 +2571,15 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
                     raw_summary = NULL
                 WHERE conversation_id = ?
             """, (remaining_steps, last_user_input, conv_id))
+            # An earlier command may have marked the session as running, and nothing is running now
+            columns = {row[1] for row in s_cur.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+            if {"status", "not_fully_idle"} <= columns:
+                s_cur.execute("""
+                    UPDATE conversation_summaries
+                    SET status = 'CASCADE_RUN_STATUS_IDLE',
+                        not_fully_idle = 0
+                    WHERE conversation_id = ?
+                """, (conv_id,))
         s_conn.commit()
         s_conn.close()
 

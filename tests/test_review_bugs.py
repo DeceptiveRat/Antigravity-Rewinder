@@ -1586,3 +1586,21 @@ def test_show_step_on_a_last_step_tool_call(base_dir, monkeypatch, capsys):
     lines = capsys.readouterr().out.splitlines()
     assert "Category:     tool_call_read" in lines
     assert [line for line in lines if line.startswith("Paired Res:")] == []
+# ---------------------------------------------------------------------------
+# A plain rewind does not leave a session marked as running
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("first", [["16"], ["1", "--replace-text", "NEW"]], ids=["armed-by-rewind", "armed-by-intervention"])
+def test_plain_rewind_clears_the_running_status(base_dir, monkeypatch, first):
+    """The status stayed as an earlier command set it, and a fork of the session inherited it."""
+    run_cli(monkeypatch, base_dir, *first)
+    assert run_state(base_dir, CONV) == ("CASCADE_RUN_STATUS_RUNNING", 1)
+
+    run_cli(monkeypatch, base_dir, "0")
+
+    assert run_state(base_dir, CONV) == ("CASCADE_RUN_STATUS_IDLE", 0)
+
+
+def test_rewind_before_a_response_still_marks_the_session_running(base_dir, monkeypatch):
+    run_cli(monkeypatch, base_dir, "16")
+    assert run_state(base_dir, CONV) == ("CASCADE_RUN_STATUS_RUNNING", 1)
