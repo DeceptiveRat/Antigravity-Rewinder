@@ -1467,6 +1467,48 @@ def apply_task_log_content(base_dir: str, conv_id: str, task_id: str, content: s
         f.write(content)
 
 
+def find_future_task_logs(base_dir: str, conv_id: str, target_step: int, category: str,
+                          simulate_error: str | None = None) -> list[tuple[str, int, int]]:
+    """
+    Lists background tasks whose logs hold output from steps that acting on target_step discards.
+    Tool calls keep their result step, so their cutoff is one step later.
+    """
+    # A simulated command error turns a background launch into a finished synchronous result
+    if category == "tool_call_command" and simulate_error is not None:
+        return []
+    cutoff_step = target_step + 1 if "tool_call" in category else target_step
+    return find_downstream_task_completions(base_dir, conv_id, cutoff_step)
+
+
+def find_unresolved_task_logs(future_tasks: list[tuple[str, int, int]], task_output: str | list[str] | None,
+                              keep_task_log: bool) -> list[tuple[str, int, int]]:
+    """Returns the future task logs that task_output and keep_task_log leave undecided."""
+    if keep_task_log:
+        return []
+    default_output, per_task_output = parse_task_output_spec(task_output)
+    if default_output is not None:
+        return []
+    return [task for task in future_tasks if task[0] not in per_task_output]
+
+
+def write_future_task_logs(base_dir: str, conv_id: str, future_tasks: list[tuple[str, int, int]],
+                           task_output: str | list[str] | None, skip_task: str | None = None,
+                           dry_run: bool = False) -> None:
+    """Writes the requested content to each future task log. Tasks with no requested content keep their log."""
+    default_output, per_task_output = parse_task_output_spec(task_output)
+    for task_id, _, _ in future_tasks:
+        if task_id == skip_task:
+            continue
+        content = per_task_output.get(task_id, default_output)
+        if content is None:
+            continue
+        if dry_run:
+            print(f"[DRY-RUN] Would update task log: tasks/{task_id}.log ({len(content)} bytes)")
+        else:
+            apply_task_log_content(base_dir, conv_id, task_id, content)
+            print(f"  - Updated task log: tasks/{task_id}.log ({len(content)} bytes).")
+
+
 def print_standout_box(lines: list[str], border_char: str = "!", is_error: bool = True, file=sys.stderr):
     """
     Prints a high-visibility bordered box to make errors or critical notices
@@ -2140,7 +2182,7 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
     # Identify cutoff timestamp and prompts from transcript_full
     src_transcript_full = transcript_full_path
     if not os.path.exists(src_transcript_full) and source_base_dir:
-        src_transcript_full = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+        src_transcript_full = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
 
     cutoff_ms = None
     rewound_prompts = set()
@@ -2382,7 +2424,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     bg_task_id = None
     src_tf = transcript_full_path
     if not os.path.exists(src_tf) and source_base_dir:
-        src_tf = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+        src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
     if os.path.exists(src_tf):
         with open(src_tf, "r", encoding="utf-8") as f:
             for line in f:
@@ -2413,7 +2455,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     if choice is not None or write_in is not None:
         src_for_qs = source_base_dir if source_base_dir else base_dir
-        questions = extract_inquiry_questions(src_for_qs, conv_id, target_step, orig_payload)
+        questions = extract_inquiry_questions(src_for_qs, src_cid, target_step, orig_payload)
         if not questions:
             questions = extract_inquiry_questions(base_dir, conv_id, target_step, orig_payload)
         if not questions:
@@ -2483,7 +2525,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                 new_str = f"The command exited with code {err_code}."
             err_detail = f"exit code {err_code}" + (f": {err_text.strip()}" if err_text else "")
         else:
-            target_url = extract_url_from_step(source_base_dir or base_dir, conv_id, target_step, result_step, orig_payload)
+            target_url = extract_url_from_step(source_base_dir or base_dir, src_cid, target_step, result_step, orig_payload)
             if not target_url:
                 target_url = "<URL>"
             err_val = str(simulate_error).strip()
@@ -2525,7 +2567,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             # 1. Try checking steps/<result_step>/output.txt
             step_out_file = os.path.join(steps_dir, str(result_step), "output.txt")
             if not os.path.exists(step_out_file) and source_base_dir:
-                step_out_file = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "steps", str(result_step), "output.txt")
+                step_out_file = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "steps", str(result_step), "output.txt")
             if os.path.exists(step_out_file):
                 try:
                     with open(step_out_file, "r", encoding="utf-8") as f:
@@ -2545,7 +2587,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             if not extracted:
                 src_tf = transcript_full_path
                 if not os.path.exists(src_tf) and source_base_dir:
-                    src_tf = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+                    src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
                 extracted = extract_content_from_transcript(src_tf, result_step)
                 if extracted:
                     m = re.match(r"Created At: [^\n]+\nCompleted At: [^\n]+\n+(.*)", extracted, re.DOTALL)
@@ -2625,7 +2667,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     # Cutoff timestamp for history and messages: timestamp after result_step
     src_transcript_full = transcript_full_path
     if not os.path.exists(src_transcript_full) and source_base_dir:
-        src_transcript_full = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+        src_transcript_full = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
 
     cutoff_ms = None
     rewound_prompts = set()
@@ -3182,7 +3224,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
 
     src_tf = transcript_full_path
     if not os.path.exists(src_tf) and source_base_dir:
-        src_tf = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+        src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
 
     if not sender_uuid and os.path.exists(src_tf):
         with open(src_tf, "r", encoding="utf-8") as f:
@@ -3202,7 +3244,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     # Locate corresponding message artifact in messages/
     src_messages_dir = messages_dir
     if not os.path.isdir(src_messages_dir) and source_base_dir:
-        src_messages_dir = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "messages")
+        src_messages_dir = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "messages")
 
     matched_msg_file = None
     matched_msg_data = None
@@ -3819,7 +3861,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
     src_tf = transcript_full_path
     if not os.path.exists(src_tf) and source_base_dir:
-        src_tf = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "logs", "transcript_full.jsonl")
+        src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
 
     if category == "tool_call_task":
         result_step = target_step + 1
@@ -3886,9 +3928,9 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             old_str = replace_old
             new_str = replace_new
         else:
-            if replace_text is not None and not (task_status or task_exit_code is not None or task_output is not None):
+            if replace_text is not None and not (task_status or task_exit_code is not None):
                 new_str = replace_text
-            elif file_content is not None and not (task_status or task_exit_code is not None or task_output is not None):
+            elif file_content is not None and not (task_status or task_exit_code is not None):
                 new_str = file_content
             else:
                 tid_label = f'"{task_id}"' if task_id else "task"
@@ -3975,7 +4017,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             output_text=output_text,
             keep_task_log=keep_task_log,
             base_dir=base_dir,
-            conv_id=conv_id,
+            conv_id=src_cid,
             source_base_dir=source_base_dir,
             replace_old=replace_old,
             replace_new=replace_new,
@@ -4144,7 +4186,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
         src_messages_dir = messages_dir
         if not os.path.isdir(src_messages_dir) and source_base_dir:
-            src_messages_dir = os.path.join(source_base_dir, "brain", conv_id, ".system_generated", "messages")
+            src_messages_dir = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "messages")
 
         matched_msg_file = None
         matched_msg_data = None
@@ -4204,11 +4246,11 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             new_str = replace_new
             orig_text = proto_content or ""
             new_content = orig_text.replace(old_str, new_str)
-        elif replace_text is not None and not (task_status or task_exit_code is not None or task_output is not None):
+        elif replace_text is not None and not (task_status or task_exit_code is not None):
             new_content = replace_text
             old_str = proto_content or ""
             new_str = new_content
-        elif file_content is not None and not (task_status or task_exit_code is not None or task_output is not None):
+        elif file_content is not None and not (task_status or task_exit_code is not None):
             new_content = file_content
             old_str = proto_content or ""
             new_str = new_content
@@ -4299,7 +4341,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             output_text=output_text,
             keep_task_log=keep_task_log,
             base_dir=base_dir,
-            conv_id=conv_id,
+            conv_id=src_cid,
             source_base_dir=source_base_dir,
             replace_old=replace_old,
             replace_new=replace_new,
@@ -4783,6 +4825,51 @@ FORK_AT_SUBAGENT_REPORT_ERROR = (
     "subagent conversation with its parent, so the intervention would permanently change "
     "the child that the parent still points to. Use --out-dir to work on a full copy instead."
 )
+TOOL_INTERVENTION_CATEGORIES = ("tool_call_read", "tool_call_command", "tool_call_write", "tool_call_web", "tool_call_inquiry")
+TASK_INTERVENTION_CATEGORIES = ("tool_call_task", "task_notification")
+
+
+def validate_fork_request(category: str, kwargs: dict, task_output: str | list[str] | None, keep_task_log: bool) -> None:
+    """Raises ValueError for a fork that could not produce a correct result, before anything is copied."""
+    # execute_subagent_intervene edits the child conversation by ID, and a fork does not
+    # copy the child, so it would change the parent's child. The subagent_report branches
+    # in execute_fork stay in place for when forks clone the child.
+    if category == "subagent_report":
+        raise ValueError(FORK_AT_SUBAGENT_REPORT_ERROR)
+    if category in ("prompt", "model_response"):
+        return
+    if category not in TOOL_INTERVENTION_CATEGORIES + TASK_INTERVENTION_CATEGORIES:
+        raise ValueError(f"Cannot fork at a step of type '{category}'.")
+
+    has_content = any(kwargs.get(key) for key in (
+        "replace_old", "replace_text", "replace_file", "replace_web_content", "choice", "write_in", "task_status"
+    ))
+    # These two are meaningful when empty or zero: a default simulated error and a clean exit
+    has_content = has_content or kwargs.get("simulate_error") is not None or kwargs.get("task_exit_code") is not None
+    if category in TASK_INTERVENTION_CATEGORIES:
+        has_content = has_content or task_output is not None or keep_task_log
+    if not has_content:
+        raise ValueError(f"Forking at a step of type '{category}' requires intervention content.")
+
+
+def remove_failed_fork(base_dir: str, fork_conv_id: str) -> None:
+    """Removes everything a failed fork created, so it does not linger as an orphan conversation."""
+    db_path = os.path.join(base_dir, "conversations", f"{fork_conv_id}.db")
+    for path in (db_path, f"{db_path}-wal", f"{db_path}-shm", f"{db_path}-journal"):
+        if os.path.exists(path):
+            os.remove(path)
+    shutil.rmtree(os.path.join(base_dir, "brain", fork_conv_id), ignore_errors=True)
+
+    summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
+    if os.path.exists(summary_db_path):
+        conn = sqlite3.connect(summary_db_path)
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "conversation_summaries" in tables:
+            conn.execute("DELETE FROM conversation_summaries WHERE conversation_id = ?", (fork_conv_id,))
+        if "conversation_lineage" in tables:
+            conn.execute("DELETE FROM conversation_lineage WHERE fork_id = ?", (fork_conv_id,))
+        conn.commit()
+        conn.close()
 
 
 def execute_fork(
@@ -4794,25 +4881,41 @@ def execute_fork(
     arm_running: bool = False,
     category: str = "prompt",
     intervention_kwargs: dict = None,
-    fork_conv_id: str = None
+    fork_conv_id: str = None,
+    task_output: str | list[str] | None = None,
+    keep_task_log: bool = False
 ) -> str:
     """
     Creates a non-destructive conversation fork/branch at target_step.
     Parent conversation state remains completely untouched.
     Returns the newly created fork conversation ID.
     """
-    # execute_subagent_intervene edits the child conversation by ID, and a fork does not
-    # copy the child, so it would change the parent's child. The subagent_report branches
-    # below stay in place for when forks clone the child.
-    if category == "subagent_report":
-        raise ValueError(FORK_AT_SUBAGENT_REPORT_ERROR)
+    kwargs = dict(intervention_kwargs or {})
+    validate_fork_request(category, kwargs, task_output, keep_task_log)
 
     fork_cid = fork_conv_id or str(uuid.uuid4())
-    kwargs = dict(intervention_kwargs or {})
+    # A failed fork deletes its destination, so that destination must never be an existing conversation
+    if (os.path.exists(os.path.join(base_dir, "conversations", f"{fork_cid}.db"))
+            or os.path.exists(os.path.join(base_dir, "brain", fork_cid))):
+        raise ValueError(f"Fork destination already exists: {fork_cid}")
+
+    # Read from the parent now, because the fork's own transcript is truncated below
+    future_tasks = find_future_task_logs(base_dir, parent_conv_id, target_step, category, kwargs.get("simulate_error"))
+    unresolved_tasks = find_unresolved_task_logs(future_tasks, task_output, keep_task_log)
+    if unresolved_tasks:
+        names = ", ".join(task[0] for task in unresolved_tasks)
+        raise ValueError(f"Task logs hold output from steps this fork discards: {names}. Decide what they should contain.")
 
     # Detect intervention type label for lineage record
     it_type = ""
-    if category.startswith("tool_call_"):
+    if category in TASK_INTERVENTION_CATEGORIES:
+        if kwargs.get("task_status"):
+            it_type = f"task_status={kwargs['task_status']}"
+        elif kwargs.get("replace_old") or kwargs.get("replace_text") or kwargs.get("replace_file"):
+            it_type = "tool_content_replacement"
+        else:
+            it_type = "task_log_override"
+    elif category.startswith("tool_call_"):
         if kwargs.get("simulate_error") is not None:
             it_type = f"simulate_error={kwargs.get('simulate_error')}"
         elif kwargs.get("replace_old") or kwargs.get("replace_text") or kwargs.get("replace_file"):
@@ -4823,63 +4926,72 @@ def execute_fork(
             it_type = "web_content_replacement"
     elif category == "subagent_report":
         it_type = f"subagent_exit={kwargs.get('subagent_exit', 'crash')}"
-    elif category in ("tool_call_task", "task_notification"):
-        it_type = f"task_status={kwargs.get('task_status', 'override')}"
     elif arm_running or category == "model_response":
         it_type = "before_response_regeneration"
 
-    setup_fork_destination(
-        base_dir=base_dir,
-        parent_conv_id=parent_conv_id,
-        fork_conv_id=fork_cid,
-        branch_name=branch_name,
-        target_step=target_step,
-        dry_run=dry_run,
-        intervention_type=it_type
-    )
-
     src_bdir = base_dir if dry_run else None
+    target_task = None
 
-    if category in ("prompt", "model_response"):
-        execute_rewind(
-            base_dir,
-            fork_cid,
-            target_step,
+    try:
+        setup_fork_destination(
+            base_dir=base_dir,
+            parent_conv_id=parent_conv_id,
+            fork_conv_id=fork_cid,
+            branch_name=branch_name,
+            target_step=target_step,
             dry_run=dry_run,
-            source_base_dir=src_bdir,
-            arm_running=arm_running,
-            source_conv_id=(parent_conv_id if dry_run else None)
+            intervention_type=it_type
         )
-    elif category in ("tool_call_read", "tool_call_command", "tool_call_write", "tool_call_web", "tool_call_inquiry"):
-        execute_tool_intervene(
-            base_dir,
-            fork_cid,
-            target_step,
-            dry_run=dry_run,
-            source_base_dir=src_bdir,
-            source_conv_id=(parent_conv_id if dry_run else None),
-            **kwargs
-        )
-    elif category == "subagent_report":
-        execute_subagent_intervene(
-            base_dir,
-            fork_cid,
-            target_step,
-            dry_run=dry_run,
-            source_base_dir=src_bdir,
-            source_conv_id=(parent_conv_id if dry_run else None),
-            **kwargs
-        )
-    elif category in ("tool_call_task", "task_notification"):
-        execute_task_intervene(
-            base_dir,
-            fork_cid,
-            target_step,
-            dry_run=dry_run,
-            source_base_dir=src_bdir,
-            source_conv_id=(parent_conv_id if dry_run else None),
-            **kwargs
-        )
+
+        if category in ("prompt", "model_response"):
+            execute_rewind(
+                base_dir,
+                fork_cid,
+                target_step,
+                dry_run=dry_run,
+                source_base_dir=src_bdir,
+                arm_running=arm_running,
+                source_conv_id=(parent_conv_id if dry_run else None)
+            )
+        elif category in TOOL_INTERVENTION_CATEGORIES:
+            execute_tool_intervene(
+                base_dir,
+                fork_cid,
+                target_step,
+                dry_run=dry_run,
+                source_base_dir=src_bdir,
+                source_conv_id=(parent_conv_id if dry_run else None),
+                **kwargs
+            )
+        elif category == "subagent_report":
+            execute_subagent_intervene(
+                base_dir,
+                fork_cid,
+                target_step,
+                dry_run=dry_run,
+                source_base_dir=src_bdir,
+                source_conv_id=(parent_conv_id if dry_run else None),
+                **kwargs
+            )
+        elif category in TASK_INTERVENTION_CATEGORIES:
+            target_task = execute_task_intervene(
+                base_dir,
+                fork_cid,
+                target_step,
+                category=category,
+                task_output=task_output,
+                keep_task_log=keep_task_log,
+                dry_run=dry_run,
+                source_base_dir=src_bdir,
+                source_conv_id=(parent_conv_id if dry_run else None),
+                **kwargs
+            )
+
+        write_future_task_logs(base_dir, fork_cid, future_tasks, task_output, skip_task=target_task, dry_run=dry_run)
+    except BaseException:
+        if not dry_run:
+            remove_failed_fork(base_dir, fork_cid)
+        raise
 
     return fork_cid
 
@@ -5286,7 +5398,7 @@ def main():
             has_task_log_opts = bool(args.task_output is not None or getattr(args, "keep_task_log", False))
             has_task_opts = bool(has_task_intervene_opts or has_task_log_opts)
 
-            default_output, per_task_output = parse_task_output_spec(args.task_output)
+            default_output, _ = parse_task_output_spec(args.task_output)
 
             if default_output is not None and getattr(args, "keep_task_log", False):
                 print_standout_box([
@@ -5294,9 +5406,7 @@ def main():
                 ], border_char="!", file=sys.stderr)
                 sys.exit(1)
 
-            cutoff_step = target_step + 1 if "tool_call" in category else target_step
-            is_cmd_sim_error = (category == "tool_call_command" and args.simulate_error is not None)
-            downstream_tasks = [] if is_cmd_sim_error else find_downstream_task_completions(base_dir, conv_id, cutoff_step)
+            downstream_tasks = find_future_task_logs(base_dir, conv_id, target_step, category, args.simulate_error)
 
             if category in ("prompt", "model_response"):
                 if has_replace_opts or has_error_opt or has_web_opt or has_inquiry_opts or has_subagent_opts or has_task_intervene_opts:
@@ -5364,11 +5474,7 @@ def main():
                 sys.exit(1)
 
             if downstream_tasks:
-                unresolved_tasks = []
-                for tid, notif_step, log_sz in downstream_tasks:
-                    is_resolved = getattr(args, "keep_task_log", False) or (tid in per_task_output) or (default_output is not None)
-                    if not is_resolved:
-                        unresolved_tasks.append((tid, notif_step, log_sz))
+                unresolved_tasks = find_unresolved_task_logs(downstream_tasks, args.task_output, getattr(args, "keep_task_log", False))
 
                 if unresolved_tasks:
                     if len(unresolved_tasks) == 1:
@@ -5479,28 +5585,31 @@ def main():
                     }
                 elif category in ("tool_call_task", "task_notification"):
                     intervention_kwargs = {
-                        "category": category,
                         "detail": detail,
                         "task_status": args.task_status,
                         "task_exit_code": args.task_exit_code,
-                        "task_output": args.task_output,
                         "replace_old": args.replace_old,
                         "replace_new": args.replace_new,
                         "replace_text": args.replace_text,
                         "replace_file": args.replace_file,
-                        "keep_task_log": getattr(args, "keep_task_log", False),
                     }
 
-                fork_cid = execute_fork(
-                    base_dir=base_dir,
-                    parent_conv_id=conv_id,
-                    target_step=target_step,
-                    branch_name=branch_name,
-                    dry_run=args.dry_run,
-                    arm_running=(category == "model_response"),
-                    category=category,
-                    intervention_kwargs=intervention_kwargs
-                )
+                try:
+                    fork_cid = execute_fork(
+                        base_dir=base_dir,
+                        parent_conv_id=conv_id,
+                        target_step=target_step,
+                        branch_name=branch_name,
+                        dry_run=args.dry_run,
+                        arm_running=(category == "model_response"),
+                        category=category,
+                        intervention_kwargs=intervention_kwargs,
+                        task_output=args.task_output,
+                        keep_task_log=getattr(args, "keep_task_log", False)
+                    )
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    print_standout_box([f"Error: {exc}"], border_char="!", file=sys.stderr)
+                    sys.exit(1)
 
                 if args.dry_run:
                     print_standout_box([
@@ -5601,17 +5710,8 @@ def main():
                     keep_task_log=getattr(args, "keep_task_log", False)
                 )
 
-            if downstream_tasks:
-                for tid, _, _ in downstream_tasks:
-                    if category in ("tool_call_task", "task_notification") and target_tid and tid == target_tid:
-                        continue
-                    task_out = per_task_output.get(tid, default_output)
-                    if task_out is not None:
-                        if args.dry_run:
-                            print(f"[DRY-RUN] Would update task log: tasks/{tid}.log ({len(task_out)} bytes)")
-                        else:
-                            apply_task_log_content(exec_base_dir, conv_id, tid, task_out)
-                            print(f"  - Updated task log: tasks/{tid}.log ({len(task_out)} bytes).")
+            write_future_task_logs(exec_base_dir, conv_id, downstream_tasks, args.task_output,
+                                   skip_task=target_tid, dry_run=args.dry_run)
             return
 
     # For listing or searching, ensure pipeline output is synced
