@@ -1918,13 +1918,11 @@ def build_inquiry_answer(questions: list[dict], choice_spec: str = None, write_i
 
     choice_map = {}
     if choice_spec:
-        if "=" in choice_spec:
-            parts = [p.strip() for p in choice_spec.split(",") if p.strip()]
-            for p in parts:
-                if "=" in p:
-                    k, v = p.split("=", 1)
-                    k_num = re.sub(r"^[Qq]", "", k.strip())
-                    choice_map[int(k_num)] = v.strip()
+        if re.match(r"\s*[Qq]?\d+\s*=", choice_spec):
+            # A comma separates questions only when a question number follows it: in 1=1,3,2=2 question 1 gets 1,3
+            for part in re.split(r",\s*(?=[Qq]?\d+\s*=)", choice_spec):
+                k, v = part.split("=", 1)
+                choice_map[int(re.sub(r"^[Qq]", "", k.strip()))] = v.strip()
         elif len(questions) == 1:
             choice_map[1] = choice_spec.strip()
         else:
@@ -1941,17 +1939,25 @@ def build_inquiry_answer(questions: list[dict], choice_spec: str = None, write_i
     write_in_map = {}
     if write_in_spec:
         if "=" in write_in_spec and any(write_in_spec.startswith(f"{i}=") or write_in_spec.startswith(f"Q{i}=") for i in range(1, len(questions) + 1)):
-            pattern = re.findall(r"(?:^|,|\s*)([Qq]?\d+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^,]*))", write_in_spec)
+            # An unquoted answer runs up to the next question number, so it can hold commas, equals signs and newlines
+            pattern = re.findall(
+                r"""([Qq]?\d+)\s*=\s*(?:"([^"]*)"|'([^']*)'|(.*?))\s*(?=[,\s]\s*[Qq]?\d+\s*=|\Z)""",
+                write_in_spec,
+                re.DOTALL
+            )
             for m in pattern:
                 k_num = int(re.sub(r"^[Qq]", "", m[0]))
-                val = m[1] or m[2] or m[3]
-                write_in_map[k_num] = val.strip()
+                write_in_map[k_num] = m[1] or m[2] or m[3]
         elif len(questions) == 1:
             write_in_map[1] = write_in_spec.strip()
         else:
             raise ValueError(
                 "Multi-question step requires mapped write-in syntax, e.g. --write-in 1=\"Answer 1\" 2=\"Answer 2\"."
             )
+
+    for number in sorted(set(choice_map) | set(write_in_map)):
+        if not 1 <= number <= len(questions):
+            raise ValueError(f"Question {number} does not exist: this step has {len(questions)} question(s).")
 
     answers = []
     resolved_selections = {}
@@ -1994,6 +2000,8 @@ def build_inquiry_answer(questions: list[dict], choice_spec: str = None, write_i
                 selected_labels.append(str(label))
                 selected_ids.append(str(opt_num))
 
+            if not selected_labels:
+                raise ValueError(f"No choice given for Question {q_idx}.")
             if not is_multi and len(selected_labels) > 1:
                 raise ValueError(
                     f"Question {q_idx} does not allow multi-select (got multiple choices: {c_val})."

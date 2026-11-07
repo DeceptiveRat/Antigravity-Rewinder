@@ -12,6 +12,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
 from rewinding.Antigravity_Rewind import (
+    build_inquiry_answer,
     count_or_truncate_chunks,
     detect_step_info,
     extract_subagent_msg_info,
@@ -971,3 +972,81 @@ def test_text_box_still_accepts_plain_ascii(base_dir):
 
     assert exit_code == 0
     assert stored_payload(base_dir, 2) == tool_result_payload("CHANGED FILE TEXT")
+
+
+# ---------------------------------------------------------------------------
+# Answers to ask_question are what was typed, or refused
+# ---------------------------------------------------------------------------
+
+ONE_QUESTION = [{"question": "Pick", "options": [{"label": "One"}, {"label": "Two"}, {"label": "Three"}], "is_multi_select": True}]
+ONE_SINGLE_CHOICE = [{"question": "Pick", "options": [{"label": "One"}, {"label": "Two"}, {"label": "Three"}]}]
+TWO_QUESTIONS = ONE_QUESTION + [{"question": "Again", "options": [{"label": "Yes"}, {"label": "No"}], "is_multi_select": True}]
+
+
+@pytest.mark.parametrize("questions, spec, expected", [
+    (ONE_QUESTION, "1,3", "A1: One, Three"),
+    (ONE_QUESTION, "1=1,3", "A1: One, Three"),
+    (ONE_QUESTION, "Q1=1,3", "A1: One, Three"),
+    (ONE_QUESTION, "q1 = 1, 3", "A1: One, Three"),
+    (ONE_QUESTION, "Two", "A1: Two"),
+    (ONE_SINGLE_CHOICE, "1=2", "A1: Two"),
+    (TWO_QUESTIONS, "1=1,3,2=2", "A1: One, Three\nA2: No"),
+    (TWO_QUESTIONS, "2=1,2,1=3", "A1: Three\nA2: Yes, No"),
+    (TWO_QUESTIONS, "2,1", "A1: Two\nA2: Yes"),
+])
+def test_choice_selects_exactly_what_was_given(questions, spec, expected):
+    """1=1,3 used to select only option 1, without saying so."""
+    assert build_inquiry_answer(questions, choice_spec=spec)[0] == expected
+
+
+@pytest.mark.parametrize("questions, spec, message", [
+    (ONE_QUESTION, "2=1", "Question 2 does not exist: this step has 1 question(s)."),
+    (ONE_QUESTION, "1=1,2=3", "Question 2 does not exist: this step has 1 question(s)."),
+    (ONE_QUESTION, "0=1", "Question 0 does not exist: this step has 1 question(s)."),
+    (TWO_QUESTIONS, "1=1", "No choice or write-in specified for Question 2 ('Again')."),
+    (ONE_QUESTION, "1=", "No choice given for Question 1."),
+    (ONE_QUESTION, "1= , ", "No choice given for Question 1."),
+    (ONE_QUESTION, " ", "No choice given for Question 1."),
+    (ONE_QUESTION, "1=99", "Choice index 99 is out of range for Question 1 (available options: 1 to 3)."),
+    (ONE_QUESTION, "1=-1", "Choice index -1 is out of range for Question 1 (available options: 1 to 3)."),
+    (ONE_QUESTION, "nonsense", "Invalid choice 'nonsense' for Question 1. Must be a 1-based index (1 to 3)."),
+    (ONE_SINGLE_CHOICE, "1=1,3", "Question 1 does not allow multi-select (got multiple choices: 1,3)."),
+])
+def test_choice_that_cannot_be_applied_is_refused(questions, spec, message):
+    with pytest.raises(ValueError) as error:
+        build_inquiry_answer(questions, choice_spec=spec)
+    assert str(error.value) == message
+
+
+@pytest.mark.parametrize("questions, spec, expected", [
+    (ONE_QUESTION, "hello, world", "A1: hello, world"),
+    (ONE_QUESTION, "1=hello, world", "A1: hello, world"),
+    (ONE_QUESTION, 'Q1="hello, world"', "A1: hello, world"),
+    (ONE_QUESTION, "1='it is, really'", "A1: it is, really"),
+    (ONE_QUESTION, "1=a=b", "A1: a=b"),
+    (ONE_QUESTION, "1=first\nsecond", "A1: first\nsecond"),
+    (TWO_QUESTIONS, "1=one, more,2=two", "A1: one, more\nA2: two"),
+    (TWO_QUESTIONS, '1="one, 2=not a key",2=two', "A1: one, 2=not a key\nA2: two"),
+    (TWO_QUESTIONS, '1="one" 2="two"', "A1: one\nA2: two"),
+])
+def test_write_in_keeps_the_whole_answer(questions, spec, expected):
+    """1=hello, world used to store only hello."""
+    assert build_inquiry_answer(questions, write_in_spec=spec)[0] == expected
+
+
+def test_write_in_for_a_question_that_does_not_exist_is_refused():
+    with pytest.raises(ValueError) as error:
+        build_inquiry_answer(TWO_QUESTIONS, write_in_spec="1=one,3=three")
+    assert str(error.value) == "Question 3 does not exist: this step has 2 question(s)."
+
+
+def test_write_in_that_only_looks_like_a_number_is_the_answer_on_a_single_question():
+    """With one question there is no other question to name, so this text can only be the answer."""
+    assert build_inquiry_answer(ONE_QUESTION, write_in_spec="2=answer")[0] == "A1: 2=answer"
+
+
+@given(st.lists(st.sampled_from(["1", "2", "3"]), min_size=1, max_size=3, unique=True))
+def test_every_multi_select_choice_is_kept_in_mapped_form(selection):
+    """Metamorphic check: the mapped and plain forms name the same options."""
+    plain = ",".join(selection)
+    assert build_inquiry_answer(ONE_QUESTION, choice_spec=f"1={plain}")[0] == build_inquiry_answer(ONE_QUESTION, choice_spec=plain)[0]
