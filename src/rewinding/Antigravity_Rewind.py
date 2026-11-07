@@ -1078,6 +1078,31 @@ def purge_messages_after_cut(messages_dir: str, cutoff_ms: int | None, keep_file
     return removed
 
 
+def remove_future_subagents(base_dir: str, conv_id: str, last_kept_step: int, dry_run: bool = False) -> int:
+    """
+    Removes the records of subagents spawned after the cut, which for the rewound agent have not happened.
+    A record with no usable spawn step stays, because removing it would be a guess. Returns how many were removed.
+    """
+    subagents_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "subagents")
+    removed = 0
+    for path in glob.glob(os.path.join(subagents_dir, "*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                spawn_step = json.load(f).get("spawnStepIndex")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(spawn_step, int) and not isinstance(spawn_step, bool) and spawn_step > last_kept_step:
+            removed += 1
+            if not dry_run:
+                os.remove(path)
+    if removed:
+        if dry_run:
+            print(f"[DRY-RUN] Would remove {removed} record(s) of subagents spawned after this point.")
+        else:
+            print(f"  - Removed {removed} record(s) of subagents spawned after this point.")
+    return removed
+
+
 def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
     """Decodes a protobuf varint starting at offset."""
     res = 0
@@ -2482,6 +2507,7 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
         print(f"[DRY-RUN] Rewind target: {target_desc}")
         print(f"[DRY-RUN] Steps remaining: {remaining_steps}")
         print(f"[DRY-RUN] Steps to be deleted from DB: {steps_to_delete}")
+        remove_future_subagents(src_dir, src_cid, target_step - 1, dry_run=True)
         print(f"[DRY-RUN] gen_metadata / executor_metadata turns remaining: {remaining_model_turns}")
         if parent_refs_to_delete:
             print(f"[DRY-RUN] parent_references entries to be deleted: {parent_refs_to_delete}")
@@ -2564,6 +2590,7 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
 
     # 8. Prune post-rewind step output artifact directories
     steps_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, dry_run=False)
+    remove_future_subagents(base_dir, conv_id, target_step - 1)
 
     # 9. Prune post-rewind background task logs
     tasks_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "tasks")
@@ -3014,6 +3041,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             print(f"[DRY-RUN] Would remove background task messages for: {bg_task_id}")
         print(f"[DRY-RUN] Steps remaining: {remaining_steps} (steps 0 to {last_result_step})")
         print(f"[DRY-RUN] Steps to be deleted from DB: {steps_to_delete}")
+        remove_future_subagents(src_dir, src_cid, last_result_step, dry_run=True)
         print(f"[DRY-RUN] gen_metadata / executor_metadata turns remaining: {remaining_model_turns}")
         if parent_refs_to_delete:
             print(f"[DRY-RUN] parent_references entries to be deleted: {parent_refs_to_delete}")
@@ -3086,6 +3114,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # 7. Remove system messages generated at or after cutoff
     messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
+
+    remove_future_subagents(base_dir, conv_id, last_result_step)
 
     # 8. Synchronize and prune step output artifacts
     st_purged, st_updated, st_removed_files = sync_or_prune_step_dirs(
@@ -3691,6 +3721,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
             print(f"[DRY-RUN] Child conversation_summaries status will be set to: 'CASCADE_RUN_STATUS_IDLE', killed: 1")
         print(f"[DRY-RUN] Steps remaining: {total_remaining_steps} (steps 0 to {effective_cutoff_step})")
         print(f"[DRY-RUN] Steps to be deleted from DB: {steps_to_delete}")
+        remove_future_subagents(src_dir, src_cid, target_step, dry_run=True)
         print(f"[DRY-RUN] gen_metadata / executor_metadata turns remaining: {remaining_model_turns}")
         if parent_refs_to_delete:
             print(f"[DRY-RUN] parent_references entries to be deleted: {parent_refs_to_delete}")
@@ -3911,6 +3942,8 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
             os.remove(presence_lock_path)
         except OSError:
             pass
+
+    remove_future_subagents(base_dir, conv_id, target_step)
 
     # 10. Prune downstream step output artifact dirs. Passing modify_step keeps the selected step's own folder.
     st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, modify_step=target_step, dry_run=False)
@@ -4304,6 +4337,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             if task_id and output_text is not None:
                 print(f"[DRY-RUN] Would update task log: tasks/{task_id}.log ({len(output_text)} bytes)")
             print(f"[DRY-RUN] Would delete {steps_to_delete} downstream step(s) from 'steps' table.")
+            remove_future_subagents(source_base_dir or base_dir, src_cid, cutoff_step, dry_run=True)
             if discrepancy_lines:
                 print_standout_box(discrepancy_lines, border_char="!", file=sys.stderr)
             return task_id
@@ -4361,6 +4395,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                 pass
 
         messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
+        remove_future_subagents(base_dir, conv_id, cutoff_step)
 
         st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=result_step, old_str=old_str, new_str=new_str,
                                                   dry_run=False, whole_result=(changes_text and not replace_old))
@@ -4636,6 +4671,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             if task_id and output_text is not None:
                 print(f"[DRY-RUN] Would update task log: tasks/{task_id}.log ({len(output_text)} bytes)")
             print(f"[DRY-RUN] Would delete {steps_to_delete} downstream step(s) from 'steps' table.")
+            remove_future_subagents(source_base_dir or base_dir, src_cid, cutoff_step, dry_run=True)
             if discrepancy_lines:
                 print_standout_box(discrepancy_lines, border_char="!", file=sys.stderr)
             return task_id
@@ -4724,6 +4760,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                 pass
 
         messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms, keep_file=matched_msg_file)
+        remove_future_subagents(base_dir, conv_id, cutoff_step)
 
         # Passing modify_step keeps the selected step's own folder, which is otherwise treated as discarded
         st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=cutoff_step, dry_run=False)

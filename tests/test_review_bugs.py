@@ -1451,3 +1451,92 @@ def test_message_file_written_for_an_edited_notification_is_kept(base_dir, monke
 
     [written] = list(messages.glob("*.json"))
     assert json.loads(written.read_text(encoding="utf-8"))["content"] == "NEW MESSAGE"
+
+
+# ---------------------------------------------------------------------------
+# Subagents spawned after the cut have not happened yet
+# ---------------------------------------------------------------------------
+
+def write_descriptor(base: Path, child: str, content: str) -> Path:
+    folder = base / "brain" / CONV / ".system_generated" / "subagents"
+    folder.mkdir(exist_ok=True)
+    path = folder / f"{child}.json"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def descriptor(spawn_step) -> str:
+    return json.dumps({"conversationId": CHILD, "spawnStepIndex": spawn_step, "state": "SUBAGENT_STATE_RUNNING",
+                       "subagentDescriptor": {}, "workspaceUris": []})
+
+
+@pytest.mark.parametrize("args", [
+    pytest.param(["0"], id="rewind"),
+    pytest.param(["1", "--replace-text", "NEW"], id="tool"),
+    pytest.param(["11", "--replace-text", "NEW"], id="manage-task"),
+])
+def test_cut_before_the_spawn_removes_the_subagents_record(base_dir, monkeypatch, capsys, args):
+    """The record stayed, so the rewound parent still listed a subagent it had not started."""
+    path = write_descriptor(base_dir, CHILD, descriptor(14))
+
+    run_cli(monkeypatch, base_dir, *args)
+
+    assert not path.exists()
+    assert "  - Removed 1 record(s) of subagents spawned after this point." in capsys.readouterr().out.splitlines()
+
+
+@pytest.mark.parametrize("args", [
+    pytest.param(["19"], id="rewind-later"),
+    pytest.param(["16"], id="rewind-to-next-step"),
+    pytest.param(["13", "--before-response"], id="rewind-to-the-call-at-14"),
+    pytest.param(["17", "--replace-text", "NEW"], id="notification"),
+    pytest.param(["15", "--subagent-exit", "keep-alive", "--replace-text", "NEW"], id="the-report-itself"),
+])
+def test_cut_after_the_spawn_keeps_the_subagents_record(base_dir, monkeypatch, args):
+    spawn = 12 if args[0] == "13" else 14
+    path = write_descriptor(base_dir, CHILD, descriptor(spawn))
+    expected = descriptor(spawn)
+
+    run_cli(monkeypatch, base_dir, *args)
+
+    assert path.read_text(encoding="utf-8") == expected
+
+
+@pytest.mark.parametrize("content", [
+    json.dumps({"conversationId": CHILD}),
+    json.dumps({"spawnStepIndex": None}),
+    json.dumps({"spawnStepIndex": "14"}),
+    json.dumps({"spawnStepIndex": True}),
+    "[]",
+    "not json",
+    "",
+    "\x00",
+])
+def test_record_without_a_usable_spawn_step_is_left_alone(base_dir, monkeypatch, content):
+    """Without a step to compare, removing the record would be a guess."""
+    path = write_descriptor(base_dir, CHILD, content)
+
+    run_cli(monkeypatch, base_dir, "0")
+
+    assert path.read_text(encoding="utf-8") == content
+
+
+def test_dry_run_reports_the_records_it_would_remove(base_dir, monkeypatch, capsys):
+    write_descriptor(base_dir, CHILD, descriptor(14))
+    before = snapshot(base_dir)
+
+    run_cli(monkeypatch, base_dir, "0", "--dry-run")
+
+    assert "[DRY-RUN] Would remove 1 record(s) of subagents spawned after this point." in capsys.readouterr().out.splitlines()
+    assert snapshot(base_dir) == before
+
+
+def test_fork_before_the_spawn_keeps_the_originals_record(base_dir, monkeypatch):
+    path = write_descriptor(base_dir, CHILD, descriptor(14))
+    expected = descriptor(14)
+
+    run_cli(monkeypatch, base_dir, "1", "--replace-text", "NEW", "--fork", "b")
+
+    fork_id = lineage(base_dir)[0][0]
+    assert path.read_text(encoding="utf-8") == expected
+    assert not (base_dir / "brain" / fork_id / ".system_generated" / "subagents" / f"{CHILD}.json").exists()
