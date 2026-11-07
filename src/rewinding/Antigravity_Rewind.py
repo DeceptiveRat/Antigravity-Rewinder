@@ -4805,7 +4805,8 @@ def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = Fal
         return 0
     with open(path, "r", encoding="utf-8") as f:
         kept, removed = remove_step_and_shift_lines(f, remove_step)
-    if not dry_run and removed > 0:
+    # Written even if the line was not there: a transcript can leave a step out, and later steps still move
+    if not dry_run:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
     return removed
@@ -4814,6 +4815,59 @@ def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = Fal
 def remove_step_and_shift_chunks(chunks_dir: str, remove_step: int, dry_run: bool = False) -> tuple[int, int]:
     """Applies step removal and index shift across chunk files."""
     return rewrite_chunks(chunks_dir, lambda lines: remove_step_and_shift_lines(lines, remove_step), dry_run)
+
+
+def remove_step_dir_and_shift(steps_dir: str, remove_step: int) -> None:
+    """Removes a step's folder and renumbers the later ones, so that each output stays with its step."""
+    if not os.path.isdir(steps_dir):
+        return
+    numbers = sorted(int(entry) for entry in os.listdir(steps_dir)
+                     if entry.isdigit() and os.path.isdir(os.path.join(steps_dir, entry)))
+    for number in numbers:
+        if number == remove_step:
+            shutil.rmtree(os.path.join(steps_dir, str(number)))
+        elif number > remove_step:
+            os.rename(os.path.join(steps_dir, str(number)), os.path.join(steps_dir, str(number - 1)))
+
+
+# Where a real step stores its own index: in step_payload, its metadata and a wrapped copy of it, and in the metadata column
+PAYLOAD_INDEX_FIELDS = frozenset({(5, 20, 2), (140, 2, 6, 2, 5, 20, 2)})
+METADATA_INDEX_FIELDS = frozenset({(20, 2)})
+
+
+def set_stored_step_index(data: bytes, old_index: int, new_index: int, index_fields: frozenset,
+                          path: tuple[int, ...] = ()) -> bytes:
+    """Changes the index a step stores about itself. Data that is not a real step's layout is returned as it is."""
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        return data
+    new_fields = []
+    for fn, wt, val in fields:
+        here = path + (fn,)
+        if wt == 0 and here in index_fields and val == old_index:
+            val = new_index
+        elif wt == 2 and any(field[:len(here)] == here for field in index_fields):
+            val = set_stored_step_index(val, old_index, new_index, index_fields, here)
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields)
+
+
+def shift_stored_step_numbers(cur: sqlite3.Cursor, conv_id: str, removed_step: int) -> None:
+    """Updates what later steps store about their own position, after the rows moved down by one."""
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(steps)").fetchall()}
+    has_metadata = "metadata" in columns
+    selected = "idx, step_payload, metadata" if has_metadata else "idx, step_payload, NULL"
+    for new_index, payload, metadata in cur.execute(f"SELECT {selected} FROM steps WHERE idx >= ?", (removed_step,)).fetchall():
+        old_index = new_index + 1
+        if payload:
+            payload = set_stored_step_index(payload, old_index, new_index, PAYLOAD_INDEX_FIELDS)
+            old_path = f"{conv_id}/.system_generated/steps/{old_index}/".encode("utf-8")
+            payload, _ = replace_in_bytes(payload, old_path, f"{conv_id}/.system_generated/steps/{new_index}/".encode("utf-8"))
+            cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (payload, new_index))
+        if metadata:
+            metadata = set_stored_step_index(metadata, old_index, new_index, METADATA_INDEX_FIELDS)
+            cur.execute("UPDATE steps SET metadata = ? WHERE idx = ?", (metadata, new_index))
 
 
 def execute_kickstart_cleanup(
@@ -4919,6 +4973,7 @@ def execute_kickstart_cleanup(
         # 1. Update SQLite
         cur.execute("DELETE FROM steps WHERE idx = ?", (k_step,))
         cur.execute("UPDATE steps SET idx = idx - 1 WHERE idx > ?", (k_step,))
+        shift_stored_step_numbers(cur, conv_id, k_step)
         if "parent_references" in tables:
             cur.execute("DELETE FROM parent_references WHERE idx = ?", (k_step,))
             cur.execute("UPDATE parent_references SET idx = idx - 1 WHERE idx > ?", (k_step,))
@@ -4934,6 +4989,9 @@ def execute_kickstart_cleanup(
         remove_step_and_shift_chunks(target_chunks_full, k_step, dry_run=False)
         remove_step_and_shift_chunks(target_chunks_comp, k_step, dry_run=False)
 
+        # 4. Update step folders
+        remove_step_dir_and_shift(os.path.join(base_dir, "brain", conv_id, ".system_generated", "steps"), k_step)
+
     conn.commit()
 
     # Calculate remaining step counts and last user input
@@ -4943,7 +5001,7 @@ def execute_kickstart_cleanup(
         last_user_input = -1
     conn.close()
 
-    # 4. Update conversation_summaries.db
+    # 5. Update conversation_summaries.db
     if os.path.exists(target_summary_db):
         with open_database(target_summary_db) as s_conn:
             s_cur = s_conn.cursor()
@@ -4952,12 +5010,13 @@ def execute_kickstart_cleanup(
                 SET step_count = ?,
                     last_user_input_step_index = ?,
                     status = 'CASCADE_RUN_STATUS_IDLE',
-                    not_fully_idle = 0
+                    not_fully_idle = 0,
+                    raw_summary = NULL
                 WHERE conversation_id = ?
             """, (remaining_steps, last_user_input, conv_id))
             s_conn.commit()
 
-    # 5. Filter history.jsonl
+    # 6. Filter history.jsonl
     if os.path.exists(target_history_path):
         kept_hist = []
         with open(target_history_path, "r", encoding="utf-8") as f:
@@ -4968,7 +5027,7 @@ def execute_kickstart_cleanup(
         with open(target_history_path, "w", encoding="utf-8") as f:
             f.writelines(kept_hist)
 
-    # 6. Purge caches
+    # 7. Purge caches
     if os.path.exists(target_proto_cache):
         os.remove(target_proto_cache)
     if os.path.exists(target_presence_lock):

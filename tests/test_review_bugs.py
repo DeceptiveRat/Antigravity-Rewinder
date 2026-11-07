@@ -1108,3 +1108,144 @@ def test_rewind_action_refuses_without_a_dialog_too(base_dir, monkeypatch):
 
     assert app.execute_action_rewind(clear_task_logs=True) == (False, "Cannot rewind to a tool result; select the tool call at step 1.")
     assert snapshot(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# --cleanup keeps every record of a later step on the same new number
+# ---------------------------------------------------------------------------
+
+KICKSTART = "__AGY_KICKSTART__"
+FOLDERS = ".system_generated/steps"
+
+
+def numbered_metadata(idx: int) -> bytes:
+    return bytes_field(20, bytes_field(1, b"aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa") + int_field(2, idx) + bytes_field(4, CONV.encode()))
+
+
+def numbered_step(idx: int, shown: int | None = None) -> bytes:
+    """A result naming its index in its metadata, in a wrapped copy of its metadata, and in its folder's path."""
+    observation = (
+        bytes_field(1, f"result of step {idx if shown is None else shown}".encode())
+        + bytes_field(6, bytes_field(1, WRAPPED_TYPE) + bytes_field(2, bytes_field(5, numbered_metadata(idx))))
+        + bytes_field(7, f"/brain/{CONV}/{FOLDERS}/{idx}/output.txt".encode())
+    )
+    return int_field(1, 132) + bytes_field(5, numbered_metadata(idx)) + bytes_field(140, bytes_field(2, observation))
+
+
+def make_steps_real_shaped(base: Path) -> None:
+    """Gives every step the stored index and the metadata column real sessions have."""
+    with open_db(base / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("ALTER TABLE steps ADD COLUMN metadata BLOB")
+        for (idx,) in conn.execute("SELECT idx FROM steps").fetchall():
+            conn.execute("UPDATE steps SET step_payload = ?, metadata = ? WHERE idx = ?", (numbered_step(idx), numbered_metadata(idx), idx))
+
+
+def add_kickstart(base: Path, step: int) -> None:
+    with open_db(base / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("UPDATE steps SET step_type = 14, step_payload = ? WHERE idx = ?", (KICKSTART.encode(), step))
+    for path in transcript_files(base):
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for record in records:
+            if record["step_index"] == step:
+                record["content"] = KICKSTART
+                record["type"] = "USER_INPUT"
+        path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+
+
+def add_step_folder(base: Path, step: int) -> None:
+    folder = base / "brain" / CONV / ".system_generated" / "steps" / str(step)
+    folder.mkdir(parents=True)
+    (folder / "output.txt").write_text(f"output of step {step}", encoding="utf-8")
+
+
+def step_folders(base: Path) -> dict[str, str]:
+    root = base / "brain" / CONV / ".system_generated" / "steps"
+    return {path.name: (path / "output.txt").read_text(encoding="utf-8") for path in root.iterdir()}
+
+
+def transcript_indices(path: Path) -> list[int]:
+    return [json.loads(line)["step_index"] for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_cleanup_shifts_chunks_split_across_files(base_dir, monkeypatch):
+    """A chunk without the removed step kept its old numbers, so it disagreed with the transcript."""
+    add_kickstart(base_dir, 19)
+    records = long_session_records(base_dir)
+    write_transcript_as_chunks(base_dir, records)
+    assert starts_inside_a_character(chunk_folder(base_dir)) != []
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert_chunks_match_transcript(base_dir)
+    logs = base_dir / "brain" / CONV / ".system_generated" / "logs"
+    assert transcript_indices(logs / "transcript_full.jsonl") == list(range(21))
+
+
+def test_cleanup_shifts_a_transcript_that_lacks_the_kickstart(base_dir, monkeypatch):
+    """The compact transcript can leave a step out, and it was only saved if it held the removed line."""
+    add_kickstart(base_dir, 19)
+    compact = base_dir / "brain" / CONV / ".system_generated" / "logs" / "transcript.jsonl"
+    lines = [line for line in compact.read_text(encoding="utf-8").splitlines() if json.loads(line)["step_index"] != 19]
+    compact.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert transcript_indices(compact) == list(range(21))
+
+
+def test_cleanup_renumbers_step_folders_so_outputs_stay_with_their_steps(base_dir, monkeypatch):
+    """Folders kept their numbers, so a later step's output was attached to the wrong step."""
+    add_kickstart(base_dir, 19)
+    for step in (4, 19, 20, 21):
+        add_step_folder(base_dir, step)
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert step_folders(base_dir) == {"4": "output of step 4", "19": "output of step 20", "20": "output of step 21"}
+
+
+@pytest.mark.parametrize("kickstarts, survivors", [
+    ([19], [*range(19), 20, 21]),
+    ([6], [*range(6), *range(7, 22)]),
+    ([6, 19], [*range(6), *range(7, 19), 20, 21]),
+    ([20, 21], list(range(20))),
+])
+def test_cleanup_updates_the_numbers_stored_inside_later_steps(base_dir, monkeypatch, kickstarts, survivors):
+    """Every real step stores its own index, and its folder's path, which no longer matched its position."""
+    make_steps_real_shaped(base_dir)
+    for step in kickstarts:
+        add_kickstart(base_dir, step)
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    with open_db(base_dir / "conversations" / f"{CONV}.db") as conn:
+        rows = conn.execute("SELECT idx, step_type, step_payload, metadata FROM steps ORDER BY idx").fetchall()
+    assert [row[0] for row in rows] == list(range(len(survivors)))
+    for new_index, (original, row) in enumerate(zip(survivors, rows)):
+        if row[1] == 14:
+            continue
+        assert row[2] == numbered_step(new_index, shown=original)
+        assert row[3] == numbered_metadata(new_index)
+
+
+def test_cleanup_clears_the_stored_summary(base_dir, monkeypatch):
+    """A summary written before the cleanup can still describe the kickstart."""
+    add_kickstart(base_dir, 19)
+    with open_db(base_dir / "conversation_summaries.db") as conn:
+        conn.execute("UPDATE conversation_summaries SET raw_summary = ? WHERE conversation_id = ?", (b"mentions the kickstart", CONV))
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    with open_db(base_dir / "conversation_summaries.db") as conn:
+        assert conn.execute("SELECT raw_summary FROM conversation_summaries WHERE conversation_id = ?", (CONV,)).fetchone() == (None,)
+
+
+def test_cleanup_dry_run_changes_nothing(base_dir, monkeypatch):
+    make_steps_real_shaped(base_dir)
+    add_kickstart(base_dir, 19)
+    add_step_folder(base_dir, 20)
+    before = snapshot(base_dir)
+
+    run_cli(monkeypatch, base_dir, "--cleanup", "--dry-run")
+
+    assert snapshot(base_dir) == before
