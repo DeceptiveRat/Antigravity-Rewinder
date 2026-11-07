@@ -4543,15 +4543,25 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                     f"</SYSTEM_MESSAGE>"
                 )
 
-        new_payload = build_system_message_payload(
-            conv_id,
-            target_step,
-            msg_id,
-            new_content,
-            step_iso_ts,
-            sender=sender,
-            priority=priority
-        )
+        # Only the text changes, so the step keeps its timestamps, IDs and the fields this tool does not know.
+        # A message with no text in the database has nothing to edit, and has to be written from scratch.
+        new_payload = orig_payload
+        count = 0
+        if changes_text and proto_content:
+            escaped_pair = (json.dumps(proto_content, ensure_ascii=False)[1:-1].encode("utf-8"),
+                            json.dumps(new_content, ensure_ascii=False)[1:-1].encode("utf-8"))
+            new_payload, count = replace_in_result(orig_payload, proto_content.encode("utf-8"), new_content.encode("utf-8"),
+                                                   alternatives=[escaped_pair])
+        if changes_text and count == 0:
+            new_payload = build_system_message_payload(
+                conv_id,
+                target_step,
+                msg_id,
+                new_content,
+                step_iso_ts,
+                sender=sender,
+                priority=priority
+            )
 
         cutoff_step = target_step
 

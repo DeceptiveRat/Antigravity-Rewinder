@@ -679,3 +679,52 @@ def test_task_status_is_worded_as_asked(base_dir, monkeypatch, options, expected
     """"running" used to be written as a task that had exited with code 1."""
     run_cli(monkeypatch, base_dir, "17", *options)
     assert notification_text(base_dir, 17) == expected
+UNKNOWN_FIELD = bytes_field(77, b"a field this tool does not know")
+HEADER = "[Message] timestamp=2026-10-19T05:10:00Z sender={} priority=MESSAGE_PRIORITY_HIGH content={}"
+
+
+def real_notification(content: str) -> bytes:
+    """A real message: step metadata, three copies of the text, and fields this tool has no use for."""
+    message = (bytes_field(1, MESSAGE_ID.encode()) + bytes_field(2, CONV.encode()) + bytes_field(3, TASK_SENDER.encode())
+               + bytes_field(4, content.encode()) + int_field(5, 1) + UNKNOWN_FIELD)
+    render = bytes_field(1, b"System Message") + bytes_field(10, bytes_field(1, content.encode())) + UNKNOWN_FIELD
+    details = bytes_field(1, HEADER.format(TASK_SENDER, content).encode()) + bytes_field(2, render) + bytes_field(4, message)
+    return int_field(1, 101) + int_field(4, 3) + METADATA + bytes_field(114, details) + UNKNOWN_FIELD
+
+
+@pytest.mark.parametrize("options, expected", [
+    (["--replace-text", "NEW MESSAGE"], "NEW MESSAGE"),
+    (["--replace-old", "original", "--replace-new", "CHANGED"], "the CHANGED message"),
+    (["--task-status", "running"], f'Task id "{TASK_SENDER}" is currently running.'),
+])
+def test_editing_a_notification_changes_only_its_text(base_dir, monkeypatch, options, expected):
+    """The step was rebuilt from scratch, which replaced its timestamps and IDs and dropped fields."""
+    set_step_payload(base_dir, CONV, 17, real_notification("the original message"))
+
+    run_cli(monkeypatch, base_dir, "17", *options)
+
+    assert stored_payload(base_dir, 17) == real_notification(expected)
+
+
+def test_notification_log_option_alone_leaves_the_step_exactly_as_it_was(base_dir, monkeypatch):
+    """The step was rebuilt here too, although the option is only about the log."""
+    add_task_logs(base_dir)
+    original = real_notification("the original message")
+    set_step_payload(base_dir, CONV, 17, original)
+
+    run_cli(monkeypatch, base_dir, "17", "--task-output", "task-4=partial", "--keep-task-log")
+
+    assert stored_payload(base_dir, 17) == original
+
+
+def test_notification_without_stored_text_is_still_written(base_dir, monkeypatch):
+    """A real message can have no text in the database, so there is nothing to edit in place."""
+    bare = int_field(1, 101) + int_field(4, 3) + METADATA
+    shown = f"<SYSTEM_MESSAGE>\n{HEADER.format(f'{CONV}/task-4', 'old message')}\n</SYSTEM_MESSAGE>"
+    store_result(base_dir, 17, bare, shown)
+
+    run_cli(monkeypatch, base_dir, "17", "--replace-text", "NEW MESSAGE")
+
+    message_id, sender, text = extract_subagent_msg_info(stored_payload(base_dir, 17))
+    assert (sender, text) == (f"{CONV}/task-4", "NEW MESSAGE")
+    assert message_id is not None
