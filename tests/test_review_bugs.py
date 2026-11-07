@@ -1249,3 +1249,23 @@ def test_cleanup_dry_run_changes_nothing(base_dir, monkeypatch):
     run_cli(monkeypatch, base_dir, "--cleanup", "--dry-run")
 
     assert snapshot(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# --fork is created beside the original, so --out-dir cannot apply to it
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("step, extra", [("19", []), ("1", ["--replace-text", "NEW"]), ("1", ["--replace-text", "NEW", "--dry-run"])])
+@pytest.mark.parametrize("out_flag", ["-o", "--out-dir"])
+def test_fork_with_an_output_folder_is_refused(base_dir, tmp_path, monkeypatch, capsys, step, extra, out_flag):
+    """The destination was ignored and the fork was added to the source folder, with a success message."""
+    destination = tmp_path / "elsewhere"
+    before = snapshot(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, step, *extra, "--fork", "b", out_flag, str(destination))
+
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == error_box("--fork and --out-dir cannot be used together. A fork is always created beside the original.")
+    assert snapshot(base_dir) == before
+    assert not destination.exists()

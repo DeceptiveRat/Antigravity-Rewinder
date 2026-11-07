@@ -5831,6 +5831,13 @@ def main():
             raw_source = os.path.abspath(os.path.expanduser(args.dir))
             raw_dest = os.path.abspath(os.path.expanduser(args.out_dir)) if args.out_dir else raw_source
 
+            if getattr(args, "fork", None) is not None and args.out_dir:
+                print_standout_box(
+                    ["Error: --fork and --out-dir cannot be used together. A fork is always created beside the original."],
+                    border_char="!", file=sys.stderr
+                )
+                sys.exit(1)
+
             # Step validation: verify step exists and belongs to either prompt or an intervenable tool call
             try:
                 category, detail = detect_step_info(base_dir, conv_id, target_step)
