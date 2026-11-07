@@ -18,6 +18,7 @@ from test_forks import (
     base_dir,  # noqa: F401 (a fixture)
     block_network,  # noqa: F401 (a fixture, active for every test here)
     bytes_field,
+    error_box,
     int_field,
     open_db,
     run_cli,
@@ -597,3 +598,54 @@ def test_report_search_text_outside_the_report_is_not_found(base_dir, monkeypatc
     assert exit_info.value.code == 1
     assert f"Target string '{search}' not found in Step {REPORT_STEP} subagent report." in capsys.readouterr().err
     assert snapshot(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# Half of a replacement is refused before anything changes
+# ---------------------------------------------------------------------------
+
+HALF_REPLACEMENTS = [
+    pytest.param(["--replace-old", "Worker"], "empty", id="old-only"),
+    pytest.param(["--replace-old", "Worker", "--replace-new", ""], "empty", id="old-with-empty-new"),
+    pytest.param(["--replace-new", "X"], "no-search", id="new-only"),
+]
+STEPS_WITH_HALF_REPLACEMENT_BUG = [
+    pytest.param("17", [], 17, id="task-notification"),
+    pytest.param("11", [], 12, id="manage-task"),
+    pytest.param("15", ["--subagent-exit", "keep-alive"], 15, id="report-keep-alive"),
+    pytest.param("15", ["--subagent-exit", "crash"], 15, id="report-crash"),
+    pytest.param("15", ["--subagent-exit", "complete"], 15, id="report-complete"),
+]
+
+
+def half_replacement_error(kind: str, step: int) -> str:
+    if kind == "empty":
+        return f"The replacement text is empty, so step {step} would not change. Nothing was changed."
+    return "--replace-new needs --replace-old, the text to search for. Nothing was changed."
+
+
+@pytest.mark.parametrize("step, extra, shown_step", STEPS_WITH_HALF_REPLACEMENT_BUG)
+@pytest.mark.parametrize("options, kind", HALF_REPLACEMENTS)
+@pytest.mark.parametrize("fork", [[], ["--fork", "b"]], ids=["in-place", "fork"])
+def test_half_a_replacement_is_refused(base_dir, monkeypatch, capsys, step, extra, shown_step, options, kind, fork):
+    """These deleted later steps and reported success, and --replace-old alone turned a failed task into a success."""
+    before = snapshot(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, step, *extra, *options, *fork)
+
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == error_box(half_replacement_error(kind, shown_step))
+    assert snapshot(base_dir) == before
+
+
+def test_failed_task_is_not_rewritten_as_a_success(base_dir, monkeypatch, capsys):
+    """The exact case found by the review: a search text alone produced "exited with code 0"."""
+    failed = f'Task id "{TASK_SENDER}" finished with result:\n\nThe command exited with code 7.'
+    original = system_message_payload(MESSAGE_ID, TASK_SENDER, failed)
+    set_step_payload(base_dir, CONV, 17, original)
+
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, base_dir, "17", "--replace-old", "foo")
+
+    assert stored_payload(base_dir, 17) == original

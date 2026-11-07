@@ -1335,6 +1335,14 @@ def set_result_text(data: bytes, new_text: str, path: tuple[int, ...] = ()) -> t
     return serialize_fields(new_fields), total_count
 
 
+def check_replacement_pair(step: int, replace_old: str | None, replace_new: str | None) -> None:
+    """Half of a replacement cannot be applied, and later steps must not be deleted for a change that never happens."""
+    if replace_old and not replace_new:
+        raise ValueError(f"The replacement text is empty, so step {step} would not change. Nothing was changed.")
+    if replace_new and not replace_old:
+        raise ValueError("--replace-new needs --replace-old, the text to search for. Nothing was changed.")
+
+
 def find_field_14_4(data: bytes) -> str | None:
     """Extracts raw view_file text from protobuf payload (Field 14.4)."""
     try:
@@ -3398,6 +3406,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     marks subagent status in .system_generated/subagents/<child_uuid>.json and conversation_summaries.db,
     truncates downstream steps, and arms conversation state for resumption.
     """
+    check_replacement_pair(target_step, replace_old, replace_new)
     src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
@@ -4047,6 +4056,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
     or an asynchronous background task notification (SYSTEM_MESSAGE, step_type = 101).
     Synchronizes SQLite steps, transcripts, chunk logs, message files, and tasks/task-*.log.
     """
+    check_replacement_pair(target_step + 1 if category == "tool_call_task" else target_step, replace_old, replace_new)
     src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
@@ -5073,8 +5083,12 @@ TOOL_INTERVENTION_CATEGORIES = ("tool_call_read", "tool_call_command", "tool_cal
 TASK_INTERVENTION_CATEGORIES = ("tool_call_task", "task_notification")
 
 
-def validate_fork_request(category: str, kwargs: dict, task_output: str | list[str] | None, keep_task_log: bool) -> None:
+def validate_fork_request(category: str, target_step: int, kwargs: dict, task_output: str | list[str] | None,
+                          keep_task_log: bool) -> None:
     """Raises ValueError for a fork that could not produce a correct result, before anything is copied."""
+    if category == "subagent_report" or category in TASK_INTERVENTION_CATEGORIES:
+        shown_step = target_step + 1 if category == "tool_call_task" else target_step
+        check_replacement_pair(shown_step, kwargs.get("replace_old"), kwargs.get("replace_new"))
     if category in ("prompt", "model_response", "subagent_report"):
         return
     if category not in TOOL_INTERVENTION_CATEGORIES + TASK_INTERVENTION_CATEGORIES:
@@ -5265,7 +5279,7 @@ def execute_fork(
     Returns the newly created fork conversation ID.
     """
     kwargs = dict(intervention_kwargs or {})
-    validate_fork_request(category, kwargs, task_output, keep_task_log)
+    validate_fork_request(category, target_step, kwargs, task_output, keep_task_log)
 
     fork_cid = fork_conv_id or str(uuid.uuid4())
     # A failed fork deletes its destination, so that destination must never be an existing conversation
