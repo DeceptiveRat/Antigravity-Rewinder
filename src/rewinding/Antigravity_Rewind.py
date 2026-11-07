@@ -3259,8 +3259,7 @@ def truncate_child_subagent(base_dir: str, child_uuid: str, child_step_index: in
 
     child_db_path = os.path.join(base_dir, "conversations", f"{child_uuid}.db")
     if os.path.exists(child_db_path):
-        try:
-            conn = sqlite3.connect(child_db_path)
+        with open_database(child_db_path) as conn:
             cur = conn.cursor()
             cnt_row = cur.execute("SELECT count(*) FROM steps WHERE idx > ?", (child_step_index,)).fetchone()
             result["db_steps_deleted"] = cnt_row[0] if cnt_row else 0
@@ -3277,14 +3276,13 @@ def truncate_child_subagent(base_dir: str, child_uuid: str, child_step_index: in
                 cur.execute("DELETE FROM executor_metadata WHERE idx >= ?", (child_model_turns,))
 
                 if replace_old and replace_new:
+                    old_bytes = replace_old.encode("utf-8")
+                    new_bytes = replace_new.encode("utf-8")
                     for r_idx, r_payload in cur.execute("SELECT idx, step_payload FROM steps WHERE idx <= ?", (child_step_index,)).fetchall():
-                        if r_payload and replace_old.encode("utf-8") in r_payload:
-                            new_payload = r_payload.replace(replace_old.encode("utf-8"), replace_new.encode("utf-8"))
-                            cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, r_idx))
-                conn.commit()
-            conn.close()
-        except Exception:
-            pass
+                        if r_payload and old_bytes in r_payload:
+                            new_payload, count = replace_in_result(r_payload, old_bytes, new_bytes)
+                            if count:
+                                cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, r_idx))
 
     child_brain_dir = os.path.join(base_dir, "brain", child_uuid)
     child_logs_dir = os.path.join(child_brain_dir, ".system_generated", "logs")
@@ -3345,40 +3343,33 @@ def truncate_child_subagent(base_dir: str, child_uuid: str, child_step_index: in
                 pass
 
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
-    if os.path.exists(summary_db_path):
-        try:
-            s_conn = sqlite3.connect(summary_db_path)
-            s_cur = s_conn.cursor()
-            if not dry_run:
-                if subagent_exit in ("crash", "complete"):
-                    c_status = "CASCADE_RUN_STATUS_KILLED" if subagent_exit == "crash" else "CASCADE_RUN_STATUS_IDLE"
-                    update_sql = """
-                        UPDATE conversation_summaries
-                        SET step_count = ?,
-                            status = ?,
-                            killed = 1,
-                            not_fully_idle = 0,
-                            raw_summary = NULL
-                    """
-                    params = [child_step_index + 1, c_status]
-                else:
-                    update_sql = """
-                        UPDATE conversation_summaries
-                        SET step_count = ?,
-                            raw_summary = NULL
-                    """
-                    params = [child_step_index + 1]
-                if cutoff_iso:
-                    update_sql += ", last_modified_time = ?"
-                    params.append(cutoff_iso)
-                update_sql += " WHERE conversation_id = ?"
-                params.append(child_uuid)
-                s_cur.execute(update_sql, tuple(params))
-                s_conn.commit()
-                result["summary_updated"] = True
-            s_conn.close()
-        except Exception:
-            pass
+    if os.path.exists(summary_db_path) and not dry_run:
+        with open_database(summary_db_path) as s_conn:
+            if subagent_exit in ("crash", "complete"):
+                c_status = "CASCADE_RUN_STATUS_KILLED" if subagent_exit == "crash" else "CASCADE_RUN_STATUS_IDLE"
+                update_sql = """
+                    UPDATE conversation_summaries
+                    SET step_count = ?,
+                        status = ?,
+                        killed = 1,
+                        not_fully_idle = 0,
+                        raw_summary = NULL
+                """
+                params = [child_step_index + 1, c_status]
+            else:
+                update_sql = """
+                    UPDATE conversation_summaries
+                    SET step_count = ?,
+                        raw_summary = NULL
+                """
+                params = [child_step_index + 1]
+            if cutoff_iso:
+                update_sql += ", last_modified_time = ?"
+                params.append(cutoff_iso)
+            update_sql += " WHERE conversation_id = ?"
+            params.append(child_uuid)
+            s_conn.execute(update_sql, tuple(params))
+        result["summary_updated"] = True
 
     return result
 
@@ -3700,6 +3691,21 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
         conn.close()
         return
 
+    # Update the child first, so that a failure there leaves the parent as it was
+    child_clean_res = {}
+    if sender_uuid and child_step_index is not None:
+        child_clean_res = truncate_child_subagent(
+            base_dir=base_dir,
+            child_uuid=sender_uuid,
+            child_step_index=child_step_index,
+            subagent_exit=subagent_exit,
+            cutoff_ms=cutoff_ms,
+            cutoff_iso=now_iso,
+            replace_old=replace_old,
+            replace_new=replace_new,
+            dry_run=False
+        )
+
     # 1. Update conversations/<id>.db
     cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, target_step))
     cur.execute("DELETE FROM steps WHERE idx > ?", (target_step,))
@@ -3887,21 +3893,6 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     # Prune downstream background task logs
     tasks_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "tasks")
     tasks_purged = prune_tasks_dir(tasks_dir, target_step + 1, dry_run=False)
-
-    # 11. Synchronize and truncate child subagent artifacts
-    child_clean_res = {}
-    if sender_uuid and child_step_index is not None:
-        child_clean_res = truncate_child_subagent(
-            base_dir=base_dir,
-            child_uuid=sender_uuid,
-            child_step_index=child_step_index,
-            subagent_exit=subagent_exit,
-            cutoff_ms=cutoff_ms,
-            cutoff_iso=now_iso,
-            replace_old=replace_old,
-            replace_new=replace_new,
-            dry_run=False
-        )
 
     print(f"Successfully executed Subagent Intervene Mode on conversation {conv_id} at Step {target_step}:")
     print(f"  - Subagent UUID: {sender_uuid or 'unknown'} (exit mode: {subagent_exit})")

@@ -517,3 +517,52 @@ def test_simulated_error_keeps_the_older_format(base_dir, monkeypatch):
     new_text = "\nThe command exited with code 3.\nOutput:\ndisk full\r\n\n"
     record = wrapped(bytes_field(28, bytes_field(21, bytes_field(1, b"disk full\r\n")) + int_field(6, 3) + int_field(11, 1)))
     assert stored_payload(base_dir, 4) == result_step(bytes_field(1, new_text.encode()) + record + OUTPUT_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Changing a subagent's report keeps its stored history readable
+# ---------------------------------------------------------------------------
+
+REPORT_STEP = 15
+
+
+def child_steps(base: Path) -> dict[int, bytes]:
+    with open_db(base / "conversations" / f"{CHILD}.db") as conn:
+        return dict(conn.execute("SELECT idx, step_payload FROM steps ORDER BY idx"))
+
+
+@pytest.mark.parametrize("old, new", [("Worker", "WORKER_MUCH_LONGER"), ("Worker", "W"), ("analysis", "한글 분석")])
+def test_changing_a_report_keeps_child_steps_readable(base_dir, monkeypatch, old, new):
+    """Bytes were swapped without fixing the length before them, which made the steps unreadable."""
+    text = f"{old} finished early"
+    set_step_payload(base_dir, CHILD, 1, shape_plain(text))
+    report = f"{old} finished the analysis"
+    set_step_payload(base_dir, CONV, REPORT_STEP, system_message_payload(MESSAGE_ID, CHILD, report, child_step=2))
+
+    run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "keep-alive", "--replace-old", old, "--replace-new", new)
+
+    assert child_steps(base_dir) == {0: b"child step", 1: shape_plain(text.replace(old, new)), 2: b"child step"}
+
+
+def test_changing_a_report_leaves_child_metadata_alone(base_dir, monkeypatch):
+    """A search for "1" must not rewrite the IDs in the child's stored steps."""
+    set_step_payload(base_dir, CHILD, 1, shape_plain("value 1"))
+    set_step_payload(base_dir, CONV, REPORT_STEP, system_message_payload(MESSAGE_ID, CHILD, "report 1", child_step=2))
+
+    run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "keep-alive", "--replace-old", "1", "--replace-new", "9")
+
+    assert child_steps(base_dir)[1] == shape_plain("value 9")
+
+
+@pytest.mark.parametrize("damage", [b"not a database at all", b"\x00" * 200])
+def test_damaged_child_database_stops_before_anything_changes(base_dir, monkeypatch, capsys, damage):
+    """The failure used to be hidden, so the parent reported success with the child left as it was."""
+    (base_dir / "conversations" / f"{CHILD}.db").write_bytes(damage)
+    before = snapshot(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "crash")
+
+    assert exit_info.value.code == 1
+    assert "Error: file is not a database" in capsys.readouterr().err
+    assert snapshot(base_dir) == before
