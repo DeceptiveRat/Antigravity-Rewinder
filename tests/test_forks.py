@@ -274,7 +274,7 @@ def base_dir(tmp_path) -> Path:
 
 def add_task_logs(base: Path) -> None:
     tasks = base / "brain" / CONV / ".system_generated" / "tasks"
-    tasks.mkdir()
+    tasks.mkdir(exist_ok=True)
     (tasks / "task-2.log").write_text(LOG_2, encoding="utf-8")
     (tasks / "task-4.log").write_text(LOG_4, encoding="utf-8")
 
@@ -844,6 +844,133 @@ def test_tui_fork_key_reports_a_replacement_that_cannot_apply(base_dir, monkeypa
     assert app.status_msg == f"Fork failed: {not_found('TEXT ONLY IN OUTPUT FILE', 2)}"
     assert_no_fork_exists(base_dir)
     assert originals(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# A task log is only removed when a simulated error cancels that task's launch
+# ---------------------------------------------------------------------------
+
+LAUNCH_TEXT = f"Tool is running as a background task with task id: {CONV}/task-2"
+MENTION_TEXT = "Notes: see task-2 for details"
+BOTH_LOGS = {"task-2": LOG_2, "task-4": LOG_4}
+
+
+def transcript_paths(base: Path) -> list[Path]:
+    logs = base / "brain" / CONV / ".system_generated" / "logs"
+    return [logs / "transcript_full.jsonl", logs / "transcript.jsonl"]
+
+
+def set_tool_result(base: Path, step: int, text: str) -> None:
+    with sqlite3.connect(base / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (tool_result_payload(text), step))
+    for path in transcript_paths(base):
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for record in records:
+            if record["step_index"] == step:
+                record["content"] = text
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+
+def remove_finish_records(base: Path) -> None:
+    """Without a later finish on record, the logs do not count as future output, so no log option applies."""
+    for path in transcript_paths(base):
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        path.write_text("".join(line for line in lines if "finished with result" not in line), encoding="utf-8")
+
+
+@pytest.mark.parametrize("step, expected", [
+    # Step 1's cut point is before task-4 started, so only its log counts as legitimately gone
+    (1, {"task-2": LOG_2}),
+    (3, BOTH_LOGS),
+    (5, BOTH_LOGS),
+    (7, BOTH_LOGS),
+    (9, BOTH_LOGS),
+])
+@pytest.mark.parametrize("route", ["command line", "command line fork", "I key", "F key"])
+def test_result_that_only_mentions_a_task_keeps_its_log(base_dir, monkeypatch, step, expected, route):
+    """Any result containing text like task-2 used to delete that log, even an ordinary file read."""
+    remove_finish_records(base_dir)
+    add_task_logs(base_dir)
+    set_tool_result(base_dir, step + 1, MENTION_TEXT)
+
+    replace = ["--replace-old", "Notes", "--replace-new", NEW_TEXT]
+    if route == "command line":
+        run_cli(monkeypatch, base_dir, str(step), *replace)
+    elif route == "command line fork":
+        run_cli(monkeypatch, base_dir, str(step), *replace, "--fork", "b")
+    elif route == "I key":
+        app, _, _ = open_tui(monkeypatch, base_dir, step, answers=("Notes", NEW_TEXT))
+        app.handle_input_char(ord("i"))
+    else:
+        app, _, _ = open_tui(monkeypatch, base_dir, step, answers=(NEW_TEXT, "b"))
+        app.handle_input_char(ord("f"))
+
+    conv_id = only_fork(base_dir)[0] if "fork" in route or route == "F key" else CONV
+    assert NEW_TEXT.encode() in step_payload(base_dir, conv_id, step + 1)
+    assert task_logs(base_dir, conv_id) == expected
+
+
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(before=st.text(max_size=50), after=st.text(max_size=50))
+def test_any_result_text_mentioning_a_task_keeps_its_log(base_dir, before, after):
+    """Invariant: no text around a task's name makes a replacement delete that task's log."""
+    remove_finish_records(base_dir)
+    add_task_logs(base_dir)
+    set_tool_result(base_dir, 8, f"{before}task-2{after}")
+    fork_id = execute_fork(str(base_dir), CONV, 7, branch_name="b", category="tool_call_web",
+                           intervention_kwargs={"tool_name": "read_url_content", "replace_text": NEW_TEXT})
+    assert task_logs(base_dir, fork_id) == BOTH_LOGS
+
+
+@pytest.mark.parametrize("fork_options", [[], ["--fork", "b"]])
+def test_keep_task_log_is_honoured_on_the_command_that_started_the_task(base_dir, monkeypatch, fork_options):
+    add_task_logs(base_dir)
+    set_tool_result(base_dir, 4, LAUNCH_TEXT)
+    run_cli(monkeypatch, base_dir, "3", "--replace-old", "background task", "--replace-new", NEW_TEXT,
+            "--keep-task-log", *fork_options)
+    conv_id = only_fork(base_dir)[0] if fork_options else CONV
+    assert task_logs(base_dir, conv_id) == BOTH_LOGS
+
+
+@pytest.mark.parametrize("fork_options", [[], ["--fork", "b"]])
+def test_simulated_error_on_a_background_launch_still_removes_its_log(base_dir, monkeypatch, capsys, fork_options):
+    """This is the one case the cleanup exists for: the task no longer ran, so its log must go."""
+    add_task_logs(base_dir)
+    set_tool_result(base_dir, 4, LAUNCH_TEXT)
+    run_cli(monkeypatch, base_dir, "3", "--simulate-error", "1", *fork_options)
+    conv_id = only_fork(base_dir)[0] if fork_options else CONV
+    assert "  - Cleaned background task artifacts for 'task-2' (converted to synchronous result)." in capsys.readouterr().out.splitlines()
+    assert task_logs(base_dir, conv_id) == {"task-4": LOG_4}
+
+
+def test_simulated_web_error_keeps_a_log_the_page_only_mentions(base_dir, monkeypatch):
+    """A failed page fetch cancels no background task, whatever the page said."""
+    add_task_logs(base_dir)
+    set_tool_result(base_dir, 8, LAUNCH_TEXT)
+    run_cli(monkeypatch, base_dir, "7", "--simulate-error", "404", "--keep-task-log")
+    assert task_logs(base_dir, CONV) == BOTH_LOGS
+
+
+def test_simulated_command_error_keeps_a_log_the_output_only_mentions(base_dir, monkeypatch):
+    add_task_logs(base_dir)
+    set_tool_result(base_dir, 4, MENTION_TEXT)
+    run_cli(monkeypatch, base_dir, "3", "--simulate-error", "1")
+    assert task_logs(base_dir, CONV) == BOTH_LOGS
+
+
+@pytest.mark.parametrize("result, options, previews_removal", [
+    (LAUNCH_TEXT, ["--simulate-error", "1"], True),
+    (LAUNCH_TEXT, ["--replace-old", "background task", "--replace-new", NEW_TEXT, "--keep-task-log"], False),
+    (MENTION_TEXT, ["--simulate-error", "1"], False),
+])
+def test_dry_run_previews_log_removal_only_for_a_cancelled_launch(base_dir, monkeypatch, capsys, result, options, previews_removal):
+    add_task_logs(base_dir)
+    set_tool_result(base_dir, 4, result)
+    before = snapshot(base_dir)
+    run_cli(monkeypatch, base_dir, "3", *options, "--dry-run")
+    lines = capsys.readouterr().out.splitlines()
+    assert ("[DRY-RUN] Would remove background task log: tasks/task-2.log" in lines) == previews_removal
+    assert snapshot(base_dir) == before
 
 
 # ---------------------------------------------------------------------------

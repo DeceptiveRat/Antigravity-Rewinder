@@ -2362,6 +2362,18 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
     print(f'  JETSKI_APP_DATA_DIR="{base_dir}" agy --conversation {conv_id}')
 
 
+def is_background_launch(payload: bytes | None) -> bool:
+    """Tells a command result that started a background task apart from output that merely mentions one."""
+    if not payload:
+        return False
+    if b"background task" in payload:
+        return True
+    try:
+        return any(fn == 148 for fn, _, _ in parse_fields(payload))
+    except ValueError:
+        return False
+
+
 def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                            tool_name: str = "tool",
                            replace_old: str = None, replace_new: str = None,
@@ -2421,29 +2433,32 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         conn.close()
         raise ValueError(f"Step {result_step} has step_type {r_step_type}, expected 132 or 5 (tool result for step {target_step}).")
 
+    # Only a simulated command error means a background task never ran, which makes its log
+    # obsolete. Anywhere else, "task-N" in a result is just text.
     bg_task_id = None
-    src_tf = transcript_full_path
-    if not os.path.exists(src_tf) and source_base_dir:
-        src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
-    if os.path.exists(src_tf):
-        with open(src_tf, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    d = json.loads(line)
-                    if d.get("step_index") == result_step:
-                        cnt = d.get("content", "")
-                        m_t = re.search(r"task-(\d+)", cnt)
-                        if m_t:
-                            bg_task_id = f"task-{m_t.group(1)}"
-                        break
-                except Exception:
-                    pass
-    if not bg_task_id and orig_payload:
-        m = re.search(rb"task-(\d+)", orig_payload)
-        if m:
-            bg_task_id = f"task-{m.group(1).decode('utf-8')}"
+    if simulate_error is not None and tool_name in COMMAND_TOOLS and is_background_launch(orig_payload):
+        src_tf = transcript_full_path
+        if not os.path.exists(src_tf) and source_base_dir:
+            src_tf = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "logs", "transcript_full.jsonl")
+        if os.path.exists(src_tf):
+            with open(src_tf, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if d.get("step_index") == result_step:
+                            cnt = d.get("content", "")
+                            m_t = re.search(r"task-(\d+)", cnt)
+                            if m_t:
+                                bg_task_id = f"task-{m_t.group(1)}"
+                            break
+                    except Exception:
+                        pass
+        if not bg_task_id:
+            m = re.search(rb"task-(\d+)", orig_payload)
+            if m:
+                bg_task_id = f"task-{m.group(1).decode('utf-8')}"
 
     # Determine replacement strings and web content
     old_str = replace_old
