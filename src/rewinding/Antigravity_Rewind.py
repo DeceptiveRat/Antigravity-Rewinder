@@ -1178,11 +1178,13 @@ RESULT_FIELDS_TO_KEEP = frozenset({
     (140, 2, 3, 10, 3, 1), (140, 2, 3, 10, 3, 2),
     (140, 2, 6, 1), (140, 2, 6, 2, 5), (140, 2, 6, 2, 6), (140, 2, 6, 2, 7), (140, 2, 6, 2, 133), (140, 2, 6, 2, 147),
     (140, 2, 7),
+    (114, 4, 1), (114, 4, 2), (114, 4, 3), (114, 4, 12, 1, 1),
 })
 
-# Fields holding the text of a tool result, in the formats found in real sessions. One result can have several.
+# Fields holding the text of a tool result or message, in the formats found in real sessions. One step can have several.
 RESULT_TEXT_FIELDS = frozenset({
     (14, 4),
+    (114, 1), (114, 2, 10, 1), (114, 4, 4),
     (140, 2, 1),
     (140, 2, 3, 10, 1),
     (140, 2, 3, 10, 3, 4),
@@ -1257,20 +1259,25 @@ def tool_argument_values(payload: bytes) -> set[bytes]:
 
 
 def replace_in_result(data: bytes, old_bytes: bytes, new_bytes: bytes, path: tuple[int, ...] = (),
-                      arguments: set[bytes] = None) -> tuple[bytes, int]:
+                      arguments: set[bytes] = None, alternatives: list[tuple[bytes, bytes]] = ()) -> tuple[bytes, int]:
     """
-    Replaces text in a tool result, recalculating the lengths around it. Metadata, identifiers and copies of the
-    call's arguments stay as they are, or a short search text such as "1" would rewrite the conversation ID
-    without changing what the agent was told.
+    Replaces text in a tool result or message, recalculating the lengths around it. Metadata, identifiers and copies
+    of the call's arguments stay as they are, or a short search text such as "1" would rewrite the conversation ID
+    without changing what the agent was told. Alternatives are other (old, new) pairs for fields holding a differently
+    encoded copy. A field uses only the first pair it holds, so new text is never replaced again.
     """
-    if not old_bytes:
+    pairs = [pair for pair in [(old_bytes, new_bytes), *alternatives] if pair[0]]
+    if not pairs:
         return data, 0
     if arguments is None:
         arguments = tool_argument_values(data)
     try:
         fields = parse_fields(data)
     except ValueError:
-        return data.replace(old_bytes, new_bytes), data.count(old_bytes)
+        for old, new in pairs:
+            if old in data:
+                return data.replace(old, new), data.count(old)
+        return data, 0
 
     new_fields = []
     total_count = 0
@@ -1287,12 +1294,13 @@ def replace_in_result(data: bytes, old_bytes: bytes, new_bytes: bytes, path: tup
                 if numbered is not None:
                     val = numbered.encode("utf-8")
                     count = 1
-            if count == 0 and old_bytes in val:
-                if here in RESULT_TEXT_FIELDS:
-                    count = val.count(old_bytes)
-                    val = val.replace(old_bytes, new_bytes)
-                elif val not in arguments:
-                    val, count = replace_in_result(val, old_bytes, new_bytes, here, arguments)
+            if count == 0:
+                pair = next((pair for pair in pairs if pair[0] in val), None)
+                if pair and here in RESULT_TEXT_FIELDS:
+                    count = val.count(pair[0])
+                    val = val.replace(*pair)
+                elif pair and val not in arguments:
+                    val, count = replace_in_result(val, old_bytes, new_bytes, here, arguments, alternatives)
             total_count += count
         new_fields.append((fn, wt, val))
     return serialize_fields(new_fields), total_count
@@ -3540,7 +3548,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     elif replace_text:
         base_report = replace_text
     elif replace_old and replace_new:
-        if replace_old not in original_report and replace_old.encode("utf-8") not in orig_payload:
+        if replace_old not in original_report:
             conn.close()
             raise ValueError(f"Target string '{clean_preview(replace_old, 50)}' not found in Step {target_step} subagent report.")
         base_report = original_report.replace(replace_old, replace_new)
@@ -3562,12 +3570,12 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     # Calculate modified protobuf payload for Step target_step
     old_bytes = original_report.encode("utf-8")
     new_bytes = final_report.encode("utf-8")
-    new_payload, count = replace_in_bytes(orig_payload, old_bytes, new_bytes)
-    if count == 0 and replace_old and replace_new and not trailer:
-        new_payload, count = replace_in_bytes(orig_payload, replace_old.encode("utf-8"), replace_new.encode("utf-8"))
-    if replace_old and replace_new and replace_old != replace_new and replace_old.encode("utf-8") in new_payload:
-        new_payload, sub_count = replace_in_bytes(new_payload, replace_old.encode("utf-8"), replace_new.encode("utf-8"))
-        count += sub_count
+    # A copy of the report can be stored inside JSON arguments, where only the text it was asked to change may match
+    alternatives = [(json.dumps(original_report, ensure_ascii=False)[1:-1].encode("utf-8"),
+                     json.dumps(final_report, ensure_ascii=False)[1:-1].encode("utf-8"))]
+    if replace_old and replace_new:
+        alternatives.append((replace_old.encode("utf-8"), replace_new.encode("utf-8")))
+    new_payload, count = replace_in_result(orig_payload, old_bytes, new_bytes, alternatives=alternatives)
 
     # Synthesize Step target_step + 1 system message if crash
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3794,11 +3802,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
 
     if subagent_exit == "crash":
         for cdir in [chunks_full_dir, chunks_compact_dir]:
-            if os.path.isdir(cdir):
-                chunk_files = sorted(glob.glob(os.path.join(cdir, "*.jsonl")))
-                if chunk_files:
-                    with open(chunk_files[-1], "a", encoding="utf-8") as f:
-                        f.write(sys_full_line)
+            rewrite_chunks(cdir, lambda lines: ([*lines, sys_full_line], 0))
 
     # 6. Filter history.jsonl
     hist_removed = count_or_filter_history(history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=False)

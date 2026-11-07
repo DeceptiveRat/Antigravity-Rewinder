@@ -158,6 +158,7 @@ def starts_inside_a_character(folder: Path) -> list[str]:
     (["11", "--task-status", "failed"], 12),
     (["17", "--task-status", "failed"], 17),
     (["15", "--subagent-exit", "keep-alive", "--replace-text", "NEW TEXT"], 15),
+    (["15", "--subagent-exit", "crash"], 16),
 ])
 def test_commands_survive_chunks_split_inside_a_character(base_dir, monkeypatch, args, last_kept):
     """Reading each piece as text crashed partway on real sessions, after the database had already been changed."""
@@ -565,4 +566,34 @@ def test_damaged_child_database_stops_before_anything_changes(base_dir, monkeypa
 
     assert exit_info.value.code == 1
     assert "Error: file is not a database" in capsys.readouterr().err
+    assert snapshot(base_dir) == before
+
+
+@pytest.mark.parametrize("old, new", [
+    ("Worker", "WorkerWorker"),
+    ("a", "aa"),
+    ("the", "the the"),
+])
+def test_report_replacement_is_applied_once(base_dir, monkeypatch, old, new):
+    """When the new text held the old text, a second pass replaced it again, so the agent read something else."""
+    report = "Worker finished the analysis"
+    set_step_payload(base_dir, CONV, REPORT_STEP, system_message_payload(MESSAGE_ID, CHILD, report, child_step=2))
+
+    run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "keep-alive", "--replace-old", old, "--replace-new", new)
+
+    expected = report.replace(old, new)
+    assert stored_payload(base_dir, REPORT_STEP) == system_message_payload(MESSAGE_ID, CHILD, expected, child_step=2)
+
+
+@pytest.mark.parametrize("search", [CHILD[:8], MESSAGE_ID[:8], "MESSAGE_PRIORITY", "timestamp"])
+def test_report_search_text_outside_the_report_is_not_found(base_dir, monkeypatch, capsys, search):
+    """Text that only appeared in the message's IDs or header passed the check, and nothing was changed."""
+    set_step_payload(base_dir, CONV, REPORT_STEP, system_message_payload(MESSAGE_ID, CHILD, "Worker report", child_step=2))
+    before = snapshot(base_dir)
+
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "keep-alive", "--replace-old", search, "--replace-new", "CHANGED")
+
+    assert exit_info.value.code == 1
+    assert f"Target string '{search}' not found in Step {REPORT_STEP} subagent report." in capsys.readouterr().err
     assert snapshot(base_dir) == before
