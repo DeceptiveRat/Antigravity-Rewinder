@@ -2043,8 +2043,9 @@ def detect_step_info(base_dir: str, conv_id: str, step_idx: int) -> tuple[str, s
     if step_type == 101:
         # Step type 101 represents SYSTEM_MESSAGE / subagent report / background task notification
         sender = None
+        msg_id = None
         if payload:
-            _, p_sender, _ = extract_subagent_msg_info(payload)
+            msg_id, p_sender, _ = extract_subagent_msg_info(payload)
             if p_sender and p_sender != conv_id and p_sender != "system":
                 sender = p_sender
             if not sender:
@@ -2086,24 +2087,16 @@ def detect_step_info(base_dir: str, conv_id: str, step_idx: int) -> tuple[str, s
                 if sender:
                     break
 
-        if not sender:
-            msgs_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "messages")
-            if os.path.isdir(msgs_dir):
-                for mf in glob.glob(os.path.join(msgs_dir, "*.json")):
-                    if os.path.basename(mf) == "read.json":
-                        continue
-                    try:
-                        with open(mf, "r", encoding="utf-8") as f:
-                            md = json.load(f)
-                            snd = md.get("sender")
-                            if snd and "task-" in snd:
-                                sender = snd
-                                break
-                            if snd and snd != "system" and snd != conv_id and len(snd) == 36:
-                                sender = snd
-                                break
-                    except Exception:
-                        pass
+        # Only this step's own message file can identify it. Any other file belongs to a different message.
+        if not sender and msg_id:
+            own_file = os.path.join(base_dir, "brain", conv_id, ".system_generated", "messages", f"{msg_id}.json")
+            try:
+                with open(own_file, "r", encoding="utf-8") as f:
+                    file_sender = json.load(f).get("sender")
+            except (OSError, ValueError, AttributeError):
+                file_sender = None
+            if file_sender and file_sender != conv_id and file_sender != "system":
+                sender = file_sender
 
         if sender:
             if "task-" in sender:
