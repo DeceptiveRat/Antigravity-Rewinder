@@ -1329,3 +1329,19 @@ def test_child_step_from_the_message_file_is_still_used(base_dir, monkeypatch):
     run_cli(monkeypatch, base_dir, str(REPORT_STEP), "--subagent-exit", "crash")
 
     assert sorted(child_steps(base_dir)) == list(range(26))
+# ---------------------------------------------------------------------------
+# Changing a subagent report keeps the kept step's own folder
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("exit_mode, kept, removed", [
+    ("keep-alive", ["14", "15"], ["16", "17"]),
+    ("crash", ["14", "15"], ["16", "17"]),
+])
+def test_report_change_keeps_the_folder_of_the_step_it_keeps(base_dir, monkeypatch, exit_mode, kept, removed):
+    """The cut treated the kept step as discarded and deleted its folder."""
+    for step in map(int, kept + removed):
+        add_step_folder(base_dir, step)
+
+    run_cli(monkeypatch, base_dir, "15", "--subagent-exit", exit_mode, "--replace-text", "NEW REPORT")
+
+    assert step_folders(base_dir) == {name: f"output of step {name}" for name in kept}

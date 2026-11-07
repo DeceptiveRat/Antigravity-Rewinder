@@ -3907,8 +3907,8 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
         except OSError:
             pass
 
-    # 10. Prune downstream step output artifact dirs
-    st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, dry_run=False)
+    # 10. Prune downstream step output artifact dirs. Passing modify_step keeps the selected step's own folder.
+    st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, modify_step=target_step, dry_run=False)
 
     # Prune downstream background task logs
     tasks_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "tasks")
