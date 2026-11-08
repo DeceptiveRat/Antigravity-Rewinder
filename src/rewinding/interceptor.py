@@ -15,12 +15,22 @@ Supported Tokens:
 import json
 import logging
 import os
+import re
 import sys
 
 DEFAULT_KICKSTART_TOKEN = "__AGY_KICKSTART__"
 
 # How a system message starts. Real prompts can mention these words, so only the start of the text counts.
 SYSTEM_NOTICE_PREFIXES = ("The following is a <SYSTEM_MESSAGE>", "<SYSTEM_MESSAGE>", "[Notice]", "[Message] timestamp=")
+
+# How a typed prompt reaches the model: wrapped in tags, with the local time added after it
+USER_REQUEST = re.compile(r"\s*<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>\s*(?:<ADDITIONAL_METADATA>.*</ADDITIONAL_METADATA>\s*)?", re.DOTALL)
+
+
+def typed_text(text: str) -> str:
+    """Returns what the user typed, without the request wrapper if there is one."""
+    match = USER_REQUEST.fullmatch(text)
+    return match.group(1) if match else text.strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("interceptor")
@@ -101,7 +111,8 @@ class KickstartStripper:
             return part.get("text", "") if isinstance(part, dict) else (part if isinstance(part, str) else "")
 
         def is_kickstart_part(part) -> bool:
-            return any(token and token in part_text(part) for token in active_tokens)
+            # Only a prompt that is the token and nothing else: a real prompt quoting the token must reach the model
+            return any(token and typed_text(part_text(part)) == token for token in active_tokens)
 
         # A model turn quoting the token is the model's own words, not a kickstart. An earlier kickstart
         # stays in the history that later requests carry, so every one is removed, not just the newest.

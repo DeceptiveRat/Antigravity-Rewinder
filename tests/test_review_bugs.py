@@ -1600,29 +1600,113 @@ def test_fork_before_the_spawn_keeps_the_originals_record(base_dir, monkeypatch)
 # --replace-web-content leaves the rest of the record intact
 # ---------------------------------------------------------------------------
 
-WEB_NOTE = "  - Note: the stored result was not changed, so the agent may still read the original page. Use --replace-text to change it."
+PAGE_FOLDER = "brain/" + CONV + "/.system_generated/steps/8"
+SAVED_NOTE = f"Content saved to /{PAGE_FOLDER}/content.md\n\n"
 
 
-def test_web_content_replacement_does_not_blank_the_transcript(base_dir, monkeypatch, capsys):
-    """With no text to replace, the empty value was written over the result in every transcript."""
-    store_result(base_dir, 8, shape_plain("ORIGINAL PAGE"), TIMESTAMPS + "ORIGINAL PAGE")
+def save_page(base: Path, text: str) -> Path:
+    folder = base / PAGE_FOLDER
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "content.md").write_bytes(text.encode("utf-8"))
+    return folder / "content.md"
+
+
+@pytest.mark.parametrize("old_page, new_page", [
+    ("Example Domain\nThis domain is for examples.", "NEW PAGE"),
+    ("line one\r\nline two\r\n", "새 페이지\r\n두 번째 줄"),
+    ("Example Domain", "Example Domain, changed"),
+])
+def test_web_content_changes_the_page_inside_the_stored_result(base_dir, monkeypatch, old_page, new_page):
+    """Only content.md changed, while the agent reads the stored result, which holds the page as well."""
+    store_result(base_dir, 8, shape_plain(SAVED_NOTE + old_page), TIMESTAMPS + "Page saved.")
+    page_file = save_page(base_dir, old_page)
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", new_page)
+
+    assert stored_payload(base_dir, 8) == shape_plain(SAVED_NOTE + new_page)
+    assert page_file.read_bytes() == new_page.encode("utf-8")
+    assert shown_texts(base_dir, 8) == [TIMESTAMPS + "Page saved."] * 4
+
+
+def test_web_content_also_changes_a_transcript_that_shows_the_page(base_dir, monkeypatch):
+    store_result(base_dir, 8, shape_plain(SAVED_NOTE + "OLD PAGE"), TIMESTAMPS + SAVED_NOTE + "OLD PAGE")
+    save_page(base_dir, "OLD PAGE")
 
     run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE")
 
-    assert shown_texts(base_dir, 8) == [TIMESTAMPS + "ORIGINAL PAGE"] * 4
-    folder = base_dir / "brain" / CONV / ".system_generated" / "steps" / "8"
-    assert (folder / "content.md").read_text(encoding="utf-8") == "NEW PAGE"
+    assert shown_texts(base_dir, 8) == [TIMESTAMPS + SAVED_NOTE + "NEW PAGE"] * 4
+
+
+WEB_NOTE = "  - Note: the saved page is not in the stored result, so the result was left as it is. Use --replace-text to change it."
+
+
+@pytest.mark.parametrize("saved", [None, "a page that the stored result does not hold", ""])
+def test_web_content_leaves_a_result_that_does_not_hold_the_saved_page(base_dir, monkeypatch, capsys, saved):
+    """A result can hold only a pointer to content.md, which overwriting it would break, so it stays and a note says so."""
+    store_result(base_dir, 8, shape_plain("Saved to content.md"), TIMESTAMPS + "Saved to content.md")
+    if saved is not None:
+        save_page(base_dir, saved)
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE")
+
+    assert stored_payload(base_dir, 8) == shape_plain("Saved to content.md")
+    assert shown_texts(base_dir, 8) == [TIMESTAMPS + "Saved to content.md"] * 4
+    assert (base_dir / PAGE_FOLDER / "content.md").read_text(encoding="utf-8") == "NEW PAGE"
     assert WEB_NOTE in capsys.readouterr().out.splitlines()
 
 
-def test_web_content_note_is_absent_when_the_result_also_changes(base_dir, monkeypatch, capsys):
-    store_result(base_dir, 8, shape_plain("ORIGINAL PAGE"), TIMESTAMPS + "ORIGINAL PAGE")
+def test_web_content_note_is_absent_when_the_page_was_found(base_dir, monkeypatch, capsys):
+    store_result(base_dir, 8, shape_plain(SAVED_NOTE + "OLD PAGE"), TIMESTAMPS + "Page saved.")
+    save_page(base_dir, "OLD PAGE")
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE")
+
+    assert WEB_NOTE not in capsys.readouterr().out.splitlines()
+
+
+def test_web_content_from_a_file_is_used_the_same_way(base_dir, tmp_path, monkeypatch):
+    store_result(base_dir, 8, shape_plain(SAVED_NOTE + "OLD PAGE"), TIMESTAMPS + "Page saved.")
+    save_page(base_dir, "OLD PAGE")
+    new_page = tmp_path / "page.md"
+    new_page.write_text("PAGE FROM A FILE", encoding="utf-8")
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", str(new_page))
+
+    assert stored_payload(base_dir, 8) == shape_plain(SAVED_NOTE + "PAGE FROM A FILE")
+
+
+def test_web_content_with_a_result_replacement_keeps_each_where_it_was_asked(base_dir, monkeypatch):
+    """--replace-text names the stored result, so the page given with it only goes to content.md."""
+    store_result(base_dir, 8, shape_plain(SAVED_NOTE + "OLD PAGE"), TIMESTAMPS + "Page saved.")
+    page_file = save_page(base_dir, "OLD PAGE")
 
     run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE", "--replace-text", "NEW RESULT")
 
     assert stored_payload(base_dir, 8) == shape_plain("NEW RESULT")
-    assert shown_texts(base_dir, 8) == [TIMESTAMPS + "NEW RESULT"] * 4
-    assert WEB_NOTE not in capsys.readouterr().out.splitlines()
+    assert page_file.read_text(encoding="utf-8") == "NEW PAGE"
+
+
+def test_web_content_fork_leaves_the_original_page_alone(base_dir, monkeypatch):
+    store_result(base_dir, 8, shape_plain(SAVED_NOTE + "OLD PAGE"), TIMESTAMPS + "Page saved.")
+    save_page(base_dir, "OLD PAGE")
+    before = originals(base_dir)
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE", "--fork", "b")
+
+    fork_id = lineage(base_dir)[0][0]
+    fork_note = SAVED_NOTE.replace(CONV, fork_id)
+    assert stored_payload(base_dir, 8, fork_id) == shape_plain(fork_note + "NEW PAGE").replace(CONV.encode(), fork_id.encode())
+    assert originals(base_dir, fork_id) == before
+
+
+def test_web_content_dry_run_changes_nothing(base_dir, monkeypatch):
+    store_result(base_dir, 8, shape_plain(SAVED_NOTE + "OLD PAGE"), TIMESTAMPS + "Page saved.")
+    save_page(base_dir, "OLD PAGE")
+    before = snapshot(base_dir)
+
+    run_cli(monkeypatch, base_dir, "7", "--replace-web-content", "NEW PAGE", "--dry-run")
+
+    assert snapshot(base_dir) == before
 
 
 # ---------------------------------------------------------------------------
@@ -1657,3 +1741,328 @@ def test_plain_rewind_clears_the_running_status(base_dir, monkeypatch, first):
 def test_rewind_before_a_response_still_marks_the_session_running(base_dir, monkeypatch):
     run_cli(monkeypatch, base_dir, "16")
     assert run_state(base_dir, CONV) == ("CASCADE_RUN_STATUS_RUNNING", 1)
+
+
+# ---------------------------------------------------------------------------
+# The proxy removes a kickstart only when the whole request is the token
+# ---------------------------------------------------------------------------
+
+def wrapped_request(text: str) -> str:
+    """How a typed prompt reaches the model in a real request: wrapped in tags, with the local time added."""
+    return (f"<USER_REQUEST>\n{text}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n"
+            "The current local time is: 2026-11-08T01:05:31+09:00.\n</ADDITIONAL_METADATA>")
+
+
+@pytest.mark.parametrize("kickstart", [
+    pytest.param(wrapped_request(TOKEN), id="real-wrapped"),
+    pytest.param(f"<USER_REQUEST>\n{TOKEN}\n</USER_REQUEST>", id="wrapped-without-time"),
+    pytest.param(f"<USER_REQUEST>{TOKEN}</USER_REQUEST>", id="wrapped-without-newlines"),
+    pytest.param(f"  \n{TOKEN}\n  ", id="bare-with-whitespace"),
+    pytest.param(TOKEN, id="bare"),
+])
+def test_proxy_removes_a_kickstart_in_the_real_request_format(monkeypatch, tmp_path, kickstart):
+    """The real request wraps the prompt, so only the text inside the tags may be compared with the token."""
+    turns = [text_turn("user", "Real task"), text_turn("model", "Calling a tool"), text_turn("user", kickstart),
+             text_turn("user", NOTICE), text_turn("model", "Answer")]
+    assert after_proxy(monkeypatch, tmp_path, turns) == [turns[0], turns[1], turns[4]]
+
+
+@pytest.mark.parametrize("prompt", [
+    pytest.param(wrapped_request(f"What does {TOKEN} mean?"), id="wrapped-question"),
+    pytest.param(wrapped_request(f"{TOKEN} and then continue"), id="wrapped-token-plus-words"),
+    pytest.param(wrapped_request(f"{TOKEN}\n{TOKEN}"), id="wrapped-token-twice"),
+    pytest.param(wrapped_request(TOKEN.lower()), id="wrapped-other-case"),
+    pytest.param(f"Why did the agent say {TOKEN} in the logs?", id="bare-question"),
+    pytest.param(f"<USER_REQUEST>\nhello\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n{TOKEN}\n</ADDITIONAL_METADATA>", id="token-only-in-metadata"),
+    pytest.param(f"<USER_REQUEST>\n{TOKEN}\n", id="unclosed-tag"),
+])
+def test_proxy_keeps_a_real_prompt_that_contains_the_token(monkeypatch, tmp_path, prompt):
+    """Any prompt containing the token used to be deleted, together with the notice after it."""
+    turns = [text_turn("user", "Real task"), text_turn("user", prompt), text_turn("user", NOTICE), text_turn("model", "Answer")]
+    assert after_proxy(monkeypatch, tmp_path, turns) == turns
+
+
+@given(st.text(min_size=1, max_size=40).filter(lambda text: text.strip() != TOKEN))
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_proxy_keeps_any_wrapped_prompt_that_is_not_the_token(monkeypatch, tmp_path, text):
+    """For any typed text other than the token, the request reaches the model unchanged."""
+    turns = [text_turn("user", wrapped_request(text)), text_turn("model", "Answer")]
+    assert after_proxy(monkeypatch, tmp_path, turns) == turns
+
+
+# ---------------------------------------------------------------------------
+# --cleanup also removes the notice that the kickstart's turn added
+# ---------------------------------------------------------------------------
+
+NOTICE_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+RESTART_NOTICE = ("The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n"
+                  "[Message] timestamp=2026-11-07T16:03:52Z sender=system priority=MESSAGE_PRIORITY_LOW "
+                  "content=[Notice] All your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>")
+
+
+def session_records(base: Path) -> list[dict]:
+    path = base / "brain" / CONV / ".system_generated" / "logs" / "transcript_full.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def step_types(base: Path) -> list[int]:
+    with open_db(base / "conversations" / f"{CONV}.db") as conn:
+        return [row[0] for row in conn.execute("SELECT step_type FROM steps ORDER BY idx")]
+
+
+def expected_after_removing(records: list[dict], types: list[int], removed: set[int]) -> tuple[list[str], list[int]]:
+    """A plain oracle: the contents and step types left once the removed steps are gone."""
+    return ([r.get("content") for r in records if r["step_index"] not in removed],
+            [t for i, t in enumerate(types) if i not in removed])
+
+
+def set_system_notice(base: Path, step: int, payload: bytes, shown: str = RESTART_NOTICE) -> None:
+    with open_db(base / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("UPDATE steps SET step_type = 101, step_payload = ? WHERE idx = ?", (payload, step))
+    for path in transcript_files(base):
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for record in records:
+            if record["step_index"] == step:
+                record.update(type="SYSTEM_MESSAGE", source="SYSTEM", content=shown)
+        path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+
+
+@pytest.mark.parametrize("notice_payload, file_removed", [
+    pytest.param(system_message_payload(NOTICE_ID, "system", "[Notice] All your subagents have been stopped"), True, id="sender-in-database"),
+    # With no message ID stored, nothing ties the step to a message file, so the file is not guessed at
+    pytest.param(int_field(1, 101) + int_field(4, 3) + bytes_field(5, bytes_field(12, b"meta")), False, id="sender-only-in-transcript"),
+])
+def test_cleanup_removes_the_notice_that_followed_the_kickstart(base_dir, monkeypatch, notice_payload, file_removed):
+    """The notice stayed, so the next request still told the model that its tasks had been stopped."""
+    add_kickstart(base_dir, 17)
+    set_system_notice(base_dir, 18, notice_payload)
+    messages = write_message_file(base_dir, NOTICE_ID, "system").parent
+    (messages / "read.json").write_text(json.dumps({NOTICE_ID: True, "other": True}), encoding="utf-8")
+    contents, types = expected_after_removing(session_records(base_dir), step_types(base_dir), {17, 18})
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert [r.get("content") for r in session_records(base_dir)] == contents
+    assert [r["step_index"] for r in session_records(base_dir)] == list(range(len(contents)))
+    assert step_types(base_dir) == types
+    assert (messages / f"{NOTICE_ID}.json").exists() == (not file_removed)
+    expected_record = {} if file_removed else {NOTICE_ID: True, "other": True}
+    assert json.loads((messages / "read.json").read_text(encoding="utf-8")) == expected_record
+
+
+def test_cleanup_removes_consecutive_notices(base_dir, monkeypatch):
+    add_kickstart(base_dir, 17)
+    set_system_notice(base_dir, 18, system_message_payload(NOTICE_ID, "system", "first notice"))
+    set_system_notice(base_dir, 19, system_message_payload("dddddddd-0000-0000-0000-000000000000", "system", "second notice"))
+    contents, types = expected_after_removing(session_records(base_dir), step_types(base_dir), {17, 18, 19})
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert [r.get("content") for r in session_records(base_dir)] == contents
+    assert step_types(base_dir) == types
+
+
+@pytest.mark.parametrize("kickstart, removed", [
+    pytest.param(20, {20}, id="task-message-after-the-kickstart"),
+    pytest.param(16, {16}, id="notice-not-straight-after"),
+    pytest.param(21, {21}, id="kickstart-is-the-last-step"),
+])
+def test_cleanup_keeps_messages_that_are_not_the_kickstarts_notice(base_dir, monkeypatch, kickstart, removed):
+    """A task finishing is real information, and a notice further on belongs to a later turn."""
+    add_kickstart(base_dir, kickstart)
+    contents, types = expected_after_removing(session_records(base_dir), step_types(base_dir), removed)
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert [r.get("content") for r in session_records(base_dir)] == contents
+    assert step_types(base_dir) == types
+
+
+def test_cleanup_dry_run_names_the_notice_and_changes_nothing(base_dir, monkeypatch, capsys):
+    add_kickstart(base_dir, 17)
+    before = snapshot(base_dir)
+
+    run_cli(monkeypatch, base_dir, "--cleanup", "--dry-run")
+
+    assert "[DRY-RUN] Would also delete Step 18, the system notice added with the kickstart." in capsys.readouterr().out.splitlines()
+    assert snapshot(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# The display copy in steps.render_info changes with the result
+# ---------------------------------------------------------------------------
+
+def render_copy(code: int, output: str) -> bytes:
+    """The copy real sessions keep in steps.render_info: the same record as field 140.2.3 of the result."""
+    record = bytes_field(1, b"cat original 1") + bytes_field(2, b"/tmp/original") + int_field(3, code) + bytes_field(4, output.encode())
+    return LABELS + bytes_field(10, bytes_field(3, record))
+
+
+def task_render_copy(text: str) -> bytes:
+    return LABELS + bytes_field(10, bytes_field(1, text.encode()))
+
+
+def set_render_info(base: Path, step: int, value, conv_id: str = CONV) -> None:
+    with open_db(base / "conversations" / f"{conv_id}.db") as conn:
+        if "render_info" not in [row[1] for row in conn.execute("PRAGMA table_info(steps)")]:
+            conn.execute("ALTER TABLE steps ADD COLUMN render_info BLOB")
+        conn.execute("UPDATE steps SET render_info = ? WHERE idx = ?", (value, step))
+
+
+def render_info(base: Path, step: int, conv_id: str = CONV):
+    with open_db(base / "conversations" / f"{conv_id}.db") as conn:
+        return conn.execute("SELECT render_info FROM steps WHERE idx = ?", (step,)).fetchone()[0]
+
+
+ORIGINAL_OUTPUT = "value 1 and the original output"
+
+
+@pytest.mark.parametrize("options, expected", [
+    pytest.param(["--replace-text", "NEW OUTPUT"], render_copy(0, "NEW OUTPUT"), id="whole"),
+    pytest.param(["--replace-old", "original", "--replace-new", "CHANGED"], render_copy(0, ORIGINAL_OUTPUT.replace("original", "CHANGED")), id="partial"),
+    pytest.param(["--replace-old", "1", "--replace-new", "9"], render_copy(0, ORIGINAL_OUTPUT.replace("1", "9")), id="partial-short-text"),
+    pytest.param(["--simulate-error", "3", "--error-output", "disk full"], render_copy(3, "disk full"), id="simulated-error"),
+])
+def test_display_copy_of_a_command_changes_with_the_result(base_dir, monkeypatch, options, expected):
+    """It kept the original output, so Antigravity's display could show what the agent was no longer told."""
+    store_result(base_dir, 4, shape_newest_command(ORIGINAL_OUTPUT), TIMESTAMPS + ORIGINAL_OUTPUT)
+    set_render_info(base_dir, 4, render_copy(0, ORIGINAL_OUTPUT))
+
+    run_cli(monkeypatch, base_dir, "3", *options)
+
+    assert render_info(base_dir, 4) == expected
+
+
+def test_display_copy_of_a_task_result_changes_with_it(base_dir, monkeypatch):
+    store_result(base_dir, 12, result_step(bytes_field(1, b"task running") + bytes_field(3, task_render_copy("task running"))), TIMESTAMPS + "task running")
+    set_render_info(base_dir, 12, task_render_copy("task running"))
+
+    run_cli(monkeypatch, base_dir, "11", "--replace-text", "task finished")
+
+    assert render_info(base_dir, 12) == task_render_copy("task finished")
+
+
+@pytest.mark.parametrize("value", [
+    pytest.param(None, id="empty"),
+    pytest.param(b"", id="empty-bytes"),
+    pytest.param(b"\xff\x00broken", id="unreadable"),
+    pytest.param(b"\x00", id="null-byte"),
+    pytest.param(LABELS, id="no-record"),
+    pytest.param(bytes_field(10, bytes_field(3, bytes_field(1, b"cat original 1"))), id="record-without-output"),
+])
+def test_display_copy_that_holds_no_output_is_left_alone(base_dir, monkeypatch, value):
+    store_result(base_dir, 4, shape_newest_command(ORIGINAL_OUTPUT), TIMESTAMPS + ORIGINAL_OUTPUT)
+    set_render_info(base_dir, 4, value)
+
+    run_cli(monkeypatch, base_dir, "3", "--replace-old", "original", "--replace-new", "CHANGED")
+
+    assert render_info(base_dir, 4) == value
+
+
+def test_display_copy_changes_in_a_fork_and_not_in_the_original(base_dir, monkeypatch):
+    store_result(base_dir, 4, shape_newest_command(ORIGINAL_OUTPUT), TIMESTAMPS + ORIGINAL_OUTPUT)
+    set_render_info(base_dir, 4, render_copy(0, ORIGINAL_OUTPUT))
+
+    run_cli(monkeypatch, base_dir, "3", "--replace-text", "NEW OUTPUT", "--fork", "b")
+
+    assert render_info(base_dir, 4, lineage(base_dir)[0][0]) == render_copy(0, "NEW OUTPUT")
+    assert render_info(base_dir, 4) == render_copy(0, ORIGINAL_OUTPUT)
+
+
+def test_display_copy_is_not_changed_by_a_dry_run(base_dir, monkeypatch):
+    store_result(base_dir, 4, shape_newest_command(ORIGINAL_OUTPUT), TIMESTAMPS + ORIGINAL_OUTPUT)
+    set_render_info(base_dir, 4, render_copy(0, ORIGINAL_OUTPUT))
+    before = snapshot(base_dir)
+
+    run_cli(monkeypatch, base_dir, "3", "--replace-text", "NEW OUTPUT", "--dry-run")
+
+    assert snapshot(base_dir) == before
+
+
+# ---------------------------------------------------------------------------
+# --cleanup finds kickstarts by the same whole-prompt rule as the proxy
+# ---------------------------------------------------------------------------
+
+def set_prompt(base: Path, step: int, typed: str, stored: bytes | None = None) -> None:
+    """A prompt as real sessions keep it: the wrapped request in the transcript, and the text in the database."""
+    with open_db(base / "conversations" / f"{CONV}.db") as conn:
+        conn.execute("UPDATE steps SET step_type = 14, step_payload = ? WHERE idx = ?",
+                     (stored if stored is not None else bytes_field(1, typed.encode()), step))
+    for path in transcript_files(base):
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        for record in records:
+            if record["step_index"] == step:
+                record.update(type="USER_INPUT", source="USER_EXPLICIT", content=wrapped_request(typed))
+        path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+
+
+def write_history(base: Path, entries: list[dict]) -> None:
+    (base / "history.jsonl").write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+
+
+def read_history(base: Path) -> list[dict]:
+    return [json.loads(line) for line in (base / "history.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("typed", [
+    f"What does {TOKEN} mean?",
+    f"{TOKEN} and then continue",
+    f"{TOKEN}\n{TOKEN}",
+    TOKEN.lower(),
+])
+def test_cleanup_keeps_a_real_prompt_that_contains_the_token(base_dir, monkeypatch, capsys, typed):
+    """Any prompt containing the token was deleted as a kickstart, while the proxy now sends it to the model."""
+    set_prompt(base_dir, 19, typed)
+    before = snapshot(base_dir)
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert capsys.readouterr().out == f"No kickstart step containing token '{TOKEN}' was found in conversation {CONV}.\n"
+    assert snapshot(base_dir) == before
+
+
+def test_cleanup_removes_a_kickstart_in_the_real_prompt_format(base_dir, monkeypatch):
+    set_prompt(base_dir, 17, TOKEN)
+    set_prompt(base_dir, 19, f"What does {TOKEN} mean?")
+    contents, types = expected_after_removing(session_records(base_dir), step_types(base_dir), {17, 18})
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert [r.get("content") for r in session_records(base_dir)] == contents
+    assert step_types(base_dir) == types
+
+
+@pytest.mark.parametrize("stored, removed", [
+    pytest.param(TOKEN.encode(), True, id="token-alone"),
+    pytest.param(bytes_field(1, f"  {TOKEN}\n".encode()), True, id="token-in-a-field"),
+    pytest.param(bytes_field(1, f"Why {TOKEN}?".encode()), False, id="quoted-in-a-field"),
+    pytest.param(b"\xff\x00" + TOKEN.encode(), False, id="unreadable-with-token"),
+])
+def test_cleanup_without_a_transcript_record_reads_the_stored_prompt(base_dir, monkeypatch, stored, removed):
+    """Without a transcript line, the stored prompt decides, by the same rule."""
+    set_prompt(base_dir, 19, "placeholder", stored)
+    for path in transcript_files(base_dir):
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if json.loads(line)["step_index"] != 19]
+        path.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+    before_types = step_types(base_dir)
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert step_types(base_dir) == ([t for i, t in enumerate(before_types) if i != 19] if removed else before_types)
+
+
+def test_cleanup_removes_only_this_sessions_kickstart_from_history(base_dir, monkeypatch):
+    """Every history line containing the token was dropped, including real prompts and other sessions."""
+    set_prompt(base_dir, 17, TOKEN)
+    entries = [
+        {"conversationId": CONV, "display": "first prompt", "timestamp": 1},
+        {"conversationId": CONV, "display": TOKEN, "timestamp": 2},
+        {"conversationId": CONV, "display": f"What does {TOKEN} mean?", "timestamp": 3},
+        {"conversationId": CHILD, "display": TOKEN, "timestamp": 4},
+        {"display": "global command", "timestamp": 5},
+    ]
+    write_history(base_dir, entries)
+
+    run_cli(monkeypatch, base_dir, "--cleanup")
+
+    assert read_history(base_dir) == [entries[0], entries[2], entries[3], entries[4]]

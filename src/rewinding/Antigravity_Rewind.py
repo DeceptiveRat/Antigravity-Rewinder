@@ -1445,6 +1445,57 @@ def command_result_text(original: bytes | None, exit_code: int, output: str | No
     return f"\nThe command exited with code {exit_code}.\r\n\n"
 
 
+def set_command_record(record: bytes, exit_code: int, output: str) -> bytes:
+    """Sets the exit code (3) and output (4) of a command record, whose fields 1 and 2 are the command and its folder."""
+    seen = set()
+    new_record = []
+    for rfn, rwt, rval in parse_fields(record):
+        seen.add(rfn)
+        if rfn == 3:
+            new_record.append((3, 0, exit_code))
+        elif rfn == 4:
+            new_record.append((4, 2, output.encode("utf-8")))
+        else:
+            new_record.append((rfn, rwt, rval))
+    if 3 not in seen:
+        new_record.append((3, 0, exit_code))
+    if 4 not in seen and output:
+        new_record.append((4, 2, output.encode("utf-8")))
+    return serialize_fields(new_record)
+
+
+# steps.render_info holds what Antigravity displays for a result. For a command it is the same record as Field 140.2.3
+# of the result, so the result's field paths apply to it from there. The agent does not read it.
+RENDER_INFO_PATH = (140, 2, 3)
+
+
+def update_render_record(render_info: bytes, exit_code: int, output: str) -> bytes:
+    """Sets the exit code and output of the command record in a display copy, at Field 10.3."""
+    new_fields = []
+    for fn, wt, val in parse_fields(render_info):
+        if fn == 10 and wt == 2:
+            val = serialize_fields([(sfn, swt, set_command_record(sval, exit_code, output) if sfn == 3 and swt == 2 else sval)
+                                    for sfn, swt, sval in parse_fields(val)])
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields)
+
+
+def update_render_info(cur: sqlite3.Cursor, step: int, change) -> None:
+    """Applies the change made to a result to its display copy as well, if the step has one in a readable layout."""
+    if "render_info" not in {row[1] for row in cur.execute("PRAGMA table_info(steps)").fetchall()}:
+        return
+    row = cur.execute("SELECT render_info FROM steps WHERE idx = ?", (step,)).fetchone()
+    if not row or not isinstance(row[0], bytes) or not row[0]:
+        return
+    try:
+        parse_fields(row[0])
+        new_value = change(row[0])
+    except ValueError:
+        return
+    if new_value != row[0]:
+        cur.execute("UPDATE steps SET render_info = ? WHERE idx = ?", (new_value, step))
+
+
 def update_command_result_payload(orig_payload: bytes, exit_code: int, error_output: str | None = None,
                                   strip_background: bool = False) -> tuple[bytes, bool]:
     """
@@ -1496,22 +1547,8 @@ def update_command_result_payload(orig_payload: bytes, exit_code: int, error_out
 
     def update_record(record: bytes) -> bytes:
         nonlocal modified
-        seen = set()
-        new_record = []
-        for rfn, rwt, rval in parse_fields(record):
-            seen.add(rfn)
-            if rfn == 3:
-                new_record.append((3, 0, exit_code))
-            elif rfn == 4:
-                new_record.append((4, 2, output.encode("utf-8")))
-            else:
-                new_record.append((rfn, rwt, rval))
-        if 3 not in seen:
-            new_record.append((3, 0, exit_code))
-        if 4 not in seen and output:
-            new_record.append((4, 2, output.encode("utf-8")))
         modified = True
-        return serialize_fields(new_record)
+        return set_command_record(record, exit_code, output)
 
     try:
         original_text = read_field(orig_payload, (140, 2, 1))
@@ -2865,6 +2902,23 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     elif replace_text:
         new_str = replace_text
 
+    # The agent reads the stored result, which real sessions fill with the page as well as a pointer to content.md.
+    # So the page saved in content.md is looked for there and replaced. A result without it, such as one holding
+    # only the pointer, is left alone: the agent reaches the page through content.md, and its layout is unknown.
+    page_in_result = False
+    if web_content_text is not None and not old_str and not new_str:
+        saved_page_file = os.path.join(steps_dir, str(result_step), "content.md")
+        if not os.path.exists(saved_page_file) and source_base_dir:
+            saved_page_file = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "steps", str(result_step), "content.md")
+        saved_page = None
+        if os.path.exists(saved_page_file):
+            with open(saved_page_file, "r", encoding="utf-8", newline="") as f:
+                saved_page = f.read()
+        if saved_page and replace_in_result(orig_payload, saved_page.encode("utf-8"), web_content_text.encode("utf-8"))[1]:
+            old_str = saved_page
+            new_str = web_content_text
+            page_in_result = True
+
     if not old_str and not new_str and web_content_text is None:
         conn.close()
         raise ValueError(
@@ -2878,9 +2932,11 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         raise ValueError(f"The replacement text is empty, so step {result_step} would not change. Nothing was changed.")
 
     # Without a search text, the new text replaces the whole result
-    whole_result = not replace_old
+    whole_result = not replace_old and not page_in_result
     count = 0
     new_payload = orig_payload
+    # The same change, for the result's display copy in steps.render_info
+    render_change = None
     if new_str:
         if not old_str:
             extracted = None
@@ -2932,8 +2988,10 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             )
             if proto_mod:
                 count += 1
+                render_change = lambda data: update_render_record(data, err_code, (err_text or "").strip())
         elif whole_result:
             new_payload, count = set_result_text(orig_payload, new_str)
+            render_change = lambda data: set_result_text(data, new_str, RENDER_INFO_PATH)[0]
 
         if count == 0:
             if not old_str:
@@ -2941,9 +2999,13 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                 raise ValueError(
                     f"Could not automatically detect original observation in step {result_step} payload. Please provide --replace-old."
                 )
-            new_payload, count = replace_in_result(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8"))
+            pair = (old_str.encode("utf-8"), new_str.encode("utf-8"))
+            new_payload, count = replace_in_result(orig_payload, *pair)
             if count == 0:
-                new_payload, count = replace_in_result(orig_payload, old_str.strip().encode("utf-8"), new_str.strip().encode("utf-8"))
+                pair = (old_str.strip().encode("utf-8"), new_str.strip().encode("utf-8"))
+                new_payload, count = replace_in_result(orig_payload, *pair)
+            arguments = tool_argument_values(orig_payload)
+            render_change = lambda data: replace_in_result(data, pair[0], pair[1], RENDER_INFO_PATH, arguments)[0]
 
         if tool_name in INQUIRY_TOOLS and inquiry_questions and inquiry_resolved_selections:
             new_payload, entry_count = update_inquiry_entries(new_payload, inquiry_questions, inquiry_resolved_selections)
@@ -3084,6 +3146,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # 1. Update conversations/<id>.db
     cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, result_step))
+    if render_change:
+        update_render_info(cur, result_step, render_change)
     cur.execute("DELETE FROM steps WHERE idx > ?", (last_result_step,))
     cur.execute("DELETE FROM gen_metadata WHERE idx >= ?", (remaining_model_turns,))
     cur.execute("DELETE FROM executor_metadata WHERE idx >= ?", (remaining_model_turns,))
@@ -3186,7 +3250,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     if web_content_text is not None:
         print(f"  - Updated web content artifact: steps/{result_step}/content.md ({len(web_content_text)} bytes).")
         if not new_str:
-            print("  - Note: the stored result was not changed, so the agent may still read the original page. Use --replace-text to change it.")
+            print("  - Note: the saved page is not in the stored result, so the result was left as it is. Use --replace-text to change it.")
     print(f"  - Deleted {steps_to_delete} downstream step(s) from 'steps' table.")
     print(f"  - Remaining steps count: {remaining_steps} (steps 0 to {last_result_step}).")
     print(f"  - Truncated {tf_removed} line(s) from transcript_full.jsonl and {tc_removed} line(s) from transcript.jsonl.")
@@ -4278,10 +4342,15 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
         count = 0
         new_payload = orig_payload
+        # The same change, for the result's display copy in steps.render_info
+        render_change = None
         if changes_text and not replace_old:
             new_payload, count = set_result_text(orig_payload, new_str)
+            render_change = lambda data: set_result_text(data, new_str, RENDER_INFO_PATH)[0]
         if count == 0 and old_str:
             new_payload, count = replace_in_result(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8"))
+            arguments = tool_argument_values(orig_payload)
+            render_change = lambda data: replace_in_result(data, old_str.encode("utf-8"), new_str.encode("utf-8"), RENDER_INFO_PATH, arguments)[0]
         # With no replacement requested, such as a log option alone, there is nothing to apply
         if count == 0 and (replace_old or new_str):
             conn.close()
@@ -4364,6 +4433,8 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
         if count > 0:
             cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, result_step))
+            if render_change:
+                update_render_info(cur, result_step, render_change)
         cur.execute("DELETE FROM steps WHERE idx > ?", (cutoff_step,))
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
         trim_turn_metadata(cur, tables)
@@ -4911,6 +4982,72 @@ def shift_stored_step_numbers(cur: sqlite3.Cursor, conv_id: str, removed_step: i
             cur.execute("UPDATE steps SET metadata = ? WHERE idx = ?", (metadata, new_index))
 
 
+# How a typed prompt is stored and sent: wrapped in tags, with the local time added. The same rule as interceptor.py:
+# a prompt is a kickstart only if what was typed is the token and nothing else, so a real prompt quoting it stays.
+USER_REQUEST = re.compile(r"\s*<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>\s*(?:<ADDITIONAL_METADATA>.*</ADDITIONAL_METADATA>\s*)?", re.DOTALL)
+
+
+def typed_prompt(text: str) -> str:
+    """Returns what the user typed, without the request wrapper if there is one."""
+    match = USER_REQUEST.fullmatch(text)
+    return match.group(1) if match else text.strip()
+
+
+def stored_texts(data: bytes) -> list[str]:
+    """Every value a stored prompt holds, at any depth, read as text."""
+    texts = [data.decode("utf-8", errors="replace")]
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        return texts
+    for _, wt, val in fields:
+        if wt == 2 and val:
+            texts.extend(stored_texts(val))
+    return texts
+
+
+def is_kickstart_prompt(shown: str | None, payload: bytes | None, token: str) -> bool:
+    """Decides from the transcript line if there is one, or else from the prompt stored in the database."""
+    if shown is not None:
+        return typed_prompt(shown) == token
+    return any(typed_prompt(text) == token for text in stored_texts(payload or b""))
+
+
+def find_kickstart_notices(cur: sqlite3.Cursor, transcript_path: str, kickstart_steps: list[int]) -> tuple[list[int], list[str]]:
+    """
+    Returns the system notices straight after each kickstart prompt, and their message IDs. A prompted turn on a
+    resumed session adds one, telling the model that its subagents and background tasks were stopped. It belongs to
+    the kickstart, and the next request would still send it. Messages from tasks or subagents are real, and stay.
+    """
+    shown = {}
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                shown[record.get("step_index")] = str(record.get("content", ""))
+    notices, message_ids = [], []
+    for k_step in kickstart_steps:
+        step = k_step + 1
+        while step not in kickstart_steps:
+            row = cur.execute("SELECT step_type, step_payload FROM steps WHERE idx = ?", (step,)).fetchone()
+            if not row or row[0] != 101:
+                break
+            msg_id, sender, _ = extract_subagent_msg_info(row[1] or b"")
+            if sender is None:
+                match = re.search(r"\bsender=(\S+)", shown.get(step, ""))
+                sender = match.group(1) if match else None
+            if sender != "system":
+                break
+            notices.append(step)
+            if msg_id:
+                message_ids.append(msg_id)
+            step += 1
+    return notices, message_ids
+
+
 def execute_kickstart_cleanup(
     base_dir: str,
     conv_id: str,
@@ -4957,33 +5094,33 @@ def execute_kickstart_cleanup(
         (STEP_TYPE_USER_INPUT,)
     ).fetchall()
 
-    kickstart_steps = []
-    for idx, payload in candidate_rows:
-        if payload and token_bytes in payload:
-            kickstart_steps.append(idx)
-
-    # Fallback to transcripts if not found in SQLite payload directly
-    if not kickstart_steps and os.path.exists(transcript_full_path):
+    shown = {}
+    if os.path.exists(transcript_full_path):
         with open(transcript_full_path, "r", encoding="utf-8") as f:
             for line in f:
-                if token in line:
-                    try:
-                        d = json.loads(line)
-                        s_idx = d.get("step_index")
-                        if s_idx is not None and s_idx not in kickstart_steps:
-                            kickstart_steps.append(s_idx)
-                    except Exception:
-                        pass
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and isinstance(record.get("content"), str):
+                    shown[record.get("step_index")] = record["content"]
+
+    kickstart_steps = [idx for idx, payload in candidate_rows if is_kickstart_prompt(shown.get(idx), payload, token)]
 
     if not kickstart_steps:
         conn.close()
         print(f"No kickstart step containing token '{token}' was found in conversation {conv_id}.")
         return
 
+    notice_steps, notice_ids = find_kickstart_notices(cur, transcript_full_path, kickstart_steps)
+    removed_steps = sorted(set(kickstart_steps) | set(notice_steps), reverse=True)
+
     tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
 
     if dry_run:
         print(f"[DRY-RUN] Conversation ID: {conv_id}")
+        for n_step in notice_steps:
+            print(f"[DRY-RUN] Would also delete Step {n_step}, the system notice added with the kickstart.")
         for k_step in sorted(kickstart_steps, reverse=True):
             print(f"[DRY-RUN] Found kickstart prompt at Step {k_step} containing token '{token}'.")
             print(f"[DRY-RUN] Would delete Step {k_step} from 'steps' table.")
@@ -5010,7 +5147,7 @@ def execute_kickstart_cleanup(
         cur = conn.cursor()
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
 
-    for k_step in sorted(kickstart_steps, reverse=True):
+    for k_step in removed_steps:
         # 1. Update SQLite
         cur.execute("DELETE FROM steps WHERE idx = ?", (k_step,))
         cur.execute("UPDATE steps SET idx = idx - 1 WHERE idx > ?", (k_step,))
@@ -5062,13 +5199,28 @@ def execute_kickstart_cleanup(
         kept_hist = []
         with open(target_history_path, "r", encoding="utf-8") as f:
             for line in f:
-                if token in line:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    entry = None
+                # Only this session's kickstart: a real prompt quoting the token, and other sessions, stay
+                if (isinstance(entry, dict) and entry.get("conversationId") == conv_id
+                        and isinstance(entry.get("display"), str) and typed_prompt(entry["display"]) == token):
                     continue
                 kept_hist.append(line)
         with open(target_history_path, "w", encoding="utf-8") as f:
             f.writelines(kept_hist)
 
-    # 7. Purge caches
+    # 7. Remove the notices' message files, and their entries in read.json
+    target_messages = os.path.join(base_dir, "brain", conv_id, ".system_generated", "messages")
+    for msg_id in notice_ids:
+        message_file = os.path.join(target_messages, f"{msg_id}.json")
+        if os.path.exists(message_file):
+            os.remove(message_file)
+    if notice_ids and os.path.isdir(target_messages):
+        prune_orphan_read_json(target_messages)
+
+    # 8. Purge caches
     if os.path.exists(target_proto_cache):
         os.remove(target_proto_cache)
     if os.path.exists(target_presence_lock):
@@ -5079,6 +5231,8 @@ def execute_kickstart_cleanup(
 
     print(f"Successfully cleaned kickstart step(s) {kickstart_steps} from conversation {conv_id}:")
     print(f"  - Deleted dummy kickstart user step(s) and decremented subsequent step indices.")
+    if notice_steps:
+        print(f"  - Deleted {len(notice_steps)} system notice(s) added with the kickstart: step(s) {sorted(notice_steps)}.")
     print(f"  - Updated 'steps' table (total steps now: {remaining_steps}).")
     print(f"  - Synchronized transcript_full.jsonl, transcript.jsonl, and chunk logs.")
     print(f"  - Updated conversation_summaries.db (step_count={remaining_steps}, last_user_input={last_user_input}, status='CASCADE_RUN_STATUS_IDLE').")

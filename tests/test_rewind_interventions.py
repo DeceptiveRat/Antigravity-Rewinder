@@ -83,7 +83,7 @@ def mock_intervention_env(tmp_path):
         (10, 132, 3, make_proto_payload("Title: Example Docs\n\nOG Description: Official documentation\n\nThe full content of the article at https://example.com/docs has been saved to: /mock/path/steps/10/content.md\n\nYou can use the view_file tool to read specific sections if needed.")),
         (11, 15, 1, b"call view_file content.md"),
         (12, 132, 3, make_proto_payload("# Example Docs Header\nDocumentation body")),
-        (13, 14, 1, b"__AGY_KICKSTART__ Continue"),
+        (13, 14, 1, b"__AGY_KICKSTART__"),
         (14, 15, 1, b"Acknowledged kickstart"),
     ]
 
@@ -150,7 +150,7 @@ def mock_intervention_env(tmp_path):
         {"step_index": 10, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "Created At: 2026-10-18T09:00:09+09:00\nCompleted At: 2026-10-18T09:00:10+09:00\nTitle: Example Docs\n\nOG Description: Official documentation\n\nThe full content of the article at https://example.com/docs has been saved to: /mock/path/steps/10/content.md\n\nYou can use the view_file tool to read specific sections if needed.", "created_at": "2026-10-18T00:00:10Z"},
         {"step_index": 11, "source": "MODEL", "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "view_file", "args": {"AbsolutePath": "content.md"}}], "created_at": "2026-10-18T00:00:11Z"},
         {"step_index": 12, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "Created At: 2026-10-18T09:00:11+09:00\nCompleted At: 2026-10-18T09:00:12+09:00\n# Example Docs Header\nDocumentation body", "created_at": "2026-10-18T00:00:12Z"},
-        {"step_index": 13, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "__AGY_KICKSTART__ Continue", "created_at": "2026-10-18T00:00:13Z"},
+        {"step_index": 13, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "__AGY_KICKSTART__", "created_at": "2026-10-18T00:00:13Z"},
         {"step_index": 14, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Acknowledged kickstart", "created_at": "2026-10-18T00:00:14Z"},
     ]
 
@@ -191,7 +191,7 @@ def mock_intervention_env(tmp_path):
     hist_file = base_dir / "history.jsonl"
     hist_entries = [
         {"conversationId": conv_id, "timestamp": 1792281600000, "display": "run diagnostics and search docs"},
-        {"conversationId": conv_id, "timestamp": 1792281613000, "display": "__AGY_KICKSTART__ Continue"},
+        {"conversationId": conv_id, "timestamp": 1792281613000, "display": "__AGY_KICKSTART__"},
         {"conversationId": "other-conv-uuid", "timestamp": 1792281620000, "display": "other conversation prompt"},
     ]
     with open(hist_file, "w", encoding="utf-8") as hf:

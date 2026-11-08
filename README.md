@@ -21,7 +21,7 @@ Either operation can change the session in place, or create a fork that leaves t
   - Category A (File Reads): Modify observation text in read_file, view_file, and list_dir.
   - Category B (File Writes): Alter write_to_file and replace_file_content database observations without touching disk state.
   - Category C (Command Execution): Modify command output or simulate nonzero exit codes (--simulate-error).
-  - Category D (Web Content): Intervene on search_web queries and simulate 404 or altered Markdown in read_url_content.
+  - Category D (Web Content): Intervene on search_web queries and simulate 404 or altered Markdown in read_url_content. `--replace-web-content` writes the saved page (`content.md`), and also changes it inside the stored result, which is what the agent reads. A result that does not hold the saved page is left as it is, with a note.
   - Category E (Interactive Inquiries): Override selected options (--choice) or write-in responses (--write-in) in ask_question.
   - Category F (Subagent Orchestration): Inject synthetic crashes, completions, or keep-alive states into subagent communication turns.
   - Category G (Background Tasks): Manage background tasks, resolve future log leaks (--task-output, --keep-task-log), and catch notification-log discrepancies.
@@ -151,7 +151,7 @@ agy --conversation <conversation_id>
 
 A resumed session does not continue by itself, even after a rewind that sets its status to running. Antigravity resets the status and waits, so the model only continues once it receives a prompt (tested with agy 1.5.2). That prompt becomes a new step, which is followed by a system message.
 
-To avoid the prompt affecting the result, `src/rewinding/interceptor.py` is a mitmproxy addon that removes a chosen token from outgoing requests. Send a prompt containing the token, and clean up afterwards with:
+To avoid the prompt affecting the result, `src/rewinding/interceptor.py` is a mitmproxy addon that removes a chosen token from outgoing requests. Send a prompt that is exactly the token and nothing else, and clean up afterwards with:
 ```bash
 python3 Antigravity_Rewind.py -d ~/.gemini/antigravity-cli -c <conversation_id> --cleanup
 ```
@@ -168,8 +168,6 @@ A copy made with `--out-dir` has to be moved to that layout before it can be res
 - Only the first call's result can be changed when a step makes several calls.
 - Results of subagent management tools such as invoke_subagent cannot be changed.
 - Many real results keep no text in the database, for example about two in three `read_file` results. These cannot be changed, and the command stops with an error.
-- `--replace-web-content` only writes `content.md`. The stored result keeps the original page unless `--replace-text` is also given.
-- `src/rewinding/interceptor.py` removes any user turn that contains the token, including a real prompt that quotes it.
 - Step types and Protobuf field numbers are reverse-engineered, so an Antigravity update could change them.
 
 ## Optional ACTF Parser
