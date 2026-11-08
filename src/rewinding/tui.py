@@ -35,6 +35,7 @@ STEP_TYPE_MODEL_RESPONSE = rewind_mod.STEP_TYPE_MODEL_RESPONSE
 # The fork and intervene keys ask for replacement text on these steps
 REPLACEABLE_CATEGORIES = rewind_mod.TOOL_INTERVENTION_CATEGORIES + rewind_mod.TASK_INTERVENTION_CATEGORIES
 # A fork has its own copy of a subagent, so unlike the intervene key it can also change a subagent's report
+TEXT_BOX_REFUSAL = "Cancelled: the text box only accepts plain ASCII. Use the command line."
 FORK_TEXT_CATEGORIES = REPLACEABLE_CATEGORIES + ("subagent_report",)
 FORKABLE_CATEGORIES = ("prompt", "model_response") + FORK_TEXT_CATEGORIES
 
@@ -319,11 +320,26 @@ class RewindTUIApp:
             # Notices arrive in a box, and its border rows mean nothing in a dialog
             self.last_notice = [line for line in stderr.getvalue().splitlines() if len(set(line.strip())) > 1]
 
+    def _rewind_refusal(self, step: StepItem, arm_running: bool) -> str | None:
+        """Explains why the selected step cannot be rewound to, or returns None if it can. The command line's rules."""
+        if step.category == "model_response" or step.category.startswith("tool_call_"):
+            return None
+        if step.category == "prompt":
+            return f"Cannot rewind before a response at step {step.idx}: it is a prompt. Use R to remove it." if arm_running else None
+        if step.category == "tool_result":
+            return f"Cannot rewind to a tool result; select the tool call at step {step.idx - 1}."
+        return f"Cannot rewind to step {step.idx}: {step.category} steps cannot be rewound to."
+
     def execute_action_rewind(self, arm_running: bool = False, clear_task_logs: bool = False) -> tuple[bool, str]:
         """Performs rewind action on the currently selected step."""
         step = self.get_selected_step()
         if not step:
             return False, "No step selected."
+
+        refusal = self._rewind_refusal(step, arm_running)
+        if refusal:
+            self.status_msg = refusal
+            return False, refusal
 
         try:
             future_tasks = find_downstream_task_completions(self.base_dir, self.conv_id, step.idx)
@@ -780,6 +796,11 @@ class RewindTUIApp:
         if not step:
             return
 
+        refusal = self._rewind_refusal(step, arm_running)
+        if refusal:
+            self.status_msg = refusal
+            return
+
         label = "before Model Response" if arm_running else f"to Step {step.idx}"
         target_step = step.idx
         downstream = max(0, len(self.loader.steps) - target_step)
@@ -956,6 +977,7 @@ class RewindTUIApp:
         curses.curs_set(1)
 
         input_str = ""
+        rejected = False
         while True:
             win.erase()
             win.box()
@@ -963,11 +985,17 @@ class RewindTUIApp:
             # Display current input
             display_str = input_str[-(box_w - 6):]
             win.addstr(2, 2, "> " + display_str)
+            if rejected:
+                win.addstr(3, 2, TEXT_BOX_REFUSAL[:box_w - 4])
             win.refresh()
 
             ch = win.getch()
             if ch in (10, 13, curses.KEY_ENTER):  # Enter
                 curses.curs_set(0)
+                if rejected:
+                    # Text that could not be typed must not count as blank, which means "replace everything"
+                    self.status_msg = TEXT_BOX_REFUSAL
+                    return None
                 return input_str
             if ch == 27:  # ESC
                 curses.curs_set(0)
@@ -976,6 +1004,8 @@ class RewindTUIApp:
                 input_str = input_str[:-1]
             elif 32 <= ch <= 126:
                 input_str += chr(ch)
+            elif 128 <= ch <= 255:
+                rejected = True
 
 
 def launch_tui(base_dir: str, conv_id: str, dry_run: bool = False):

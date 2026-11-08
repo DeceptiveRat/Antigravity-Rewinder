@@ -11,6 +11,7 @@ Synchronized with the ACTF pipeline (cli.py) to parse and list all event types
 import argparse
 import contextlib
 import glob
+import io
 import json
 import os
 import pathlib
@@ -27,6 +28,9 @@ from itertools import groupby
 # Step types used by Antigravity trajectory engine
 STEP_TYPE_USER_INPUT = 14
 STEP_TYPE_MODEL_RESPONSE = 15
+
+# Size at which Antigravity cuts a transcript into chunk files
+CHUNK_SIZE = 102400
 
 # Path resolution relative to repository structure
 REAL_FILE = os.path.realpath(__file__)
@@ -730,7 +734,11 @@ def show_step(base_dir: str, conv_id: str, target_step: int):
         print(f"Paired Call:  Step {parent_step} ({p_tool or p_cat})")
     elif category.startswith("tool_call_"):
         next_step = target_step + 1
-        n_cat, _ = detect_step_info(base_dir, conv_id, next_step)
+        try:
+            n_cat, _ = detect_step_info(base_dir, conv_id, next_step)
+        except ValueError:
+            # A tool call can be the last step, with its result not written yet
+            n_cat = None
         if n_cat == "tool_result":
             print(f"Paired Res:   Step {next_step} (tool_result)")
 
@@ -854,26 +862,72 @@ def show_step(base_dir: str, conv_id: str, target_step: int):
     print("=" * 80 + "\n")
 
 
+def truncate_lines(lines, target_step: int) -> tuple[list[str], int]:
+    """Keeps only records with step_index < target_step. Returns the kept lines and the number removed."""
+    kept = []
+    removed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+            idx = data.get("step_index")
+            if idx is not None and idx >= target_step:
+                removed += 1
+                continue
+            kept.append(line if line.endswith("\n") else line + "\n")
+        except Exception:
+            kept.append(line if line.endswith("\n") else line + "\n")
+    return kept, removed
+
+
+def modify_or_truncate_lines(lines, cutoff_step: int, modify_step: int = None, old_str: str = None,
+                             new_str: str = None, dry_run: bool = False,
+                             whole_result: bool = False) -> tuple[list[str], int]:
+    """
+    Keeps lines with step_index <= cutoff_step, removing any lines with step_index > cutoff_step.
+    If modify_step is specified, updates content for that step using update_transcript_content.
+    """
+    kept = []
+    removed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+            idx = data.get("step_index")
+            if idx is not None and idx > cutoff_step:
+                removed += 1
+                continue
+            if idx is not None and idx == modify_step and not dry_run:
+                # With no text change, such as a web page replaced in content.md only, the result stays as it is
+                if old_str is not None or new_str is not None:
+                    content = data.get("content", "")
+                    data["content"] = update_transcript_content(content, old_str, new_str or "", whole_result)
+                if data.get("status") == "RUNNING":
+                    data["status"] = "DONE"
+                if "completed_at" not in data or not data.get("completed_at"):
+                    data["completed_at"] = data.get("created_at")
+                if "tool_calls" in data and isinstance(data["tool_calls"], list) and old_str:
+                    for tc in data["tool_calls"]:
+                        args = tc.get("args", {})
+                        if isinstance(args, dict):
+                            for k, v in args.items():
+                                if isinstance(v, str) and old_str in v:
+                                    args[k] = v.replace(old_str, new_str or "")
+                line = json.dumps(data, ensure_ascii=False) + "\n"
+            kept.append(line if line.endswith("\n") else line + "\n")
+        except Exception:
+            kept.append(line if line.endswith("\n") else line + "\n")
+    return kept, removed
+
+
 def count_or_truncate_jsonl(path: str, target_step: int, dry_run: bool = False) -> int:
     """Keeps only records with step_index < target_step. Returns number of removed lines."""
     if not os.path.exists(path):
         return 0
-    kept = []
-    removed = 0
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                data = json.loads(line)
-                idx = data.get("step_index")
-                if idx is not None and idx >= target_step:
-                    removed += 1
-                    continue
-                kept.append(line if line.endswith("\n") else line + "\n")
-            except Exception:
-                kept.append(line if line.endswith("\n") else line + "\n")
-
+        kept, removed = truncate_lines(f, target_step)
     if not dry_run:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
@@ -881,92 +935,65 @@ def count_or_truncate_jsonl(path: str, target_step: int, dry_run: bool = False) 
 
 
 def modify_or_truncate_jsonl(path: str, cutoff_step: int, modify_step: int = None,
-                              old_str: str = None, new_str: str = None, dry_run: bool = False) -> int:
-    """
-    Keeps lines with step_index <= cutoff_step, truncating any lines with step_index > cutoff_step.
-    If modify_step is specified, updates content for that step using update_transcript_content.
-    """
+                              old_str: str = None, new_str: str = None, dry_run: bool = False,
+                              whole_result: bool = False) -> int:
+    """Applies modify_or_truncate_lines to a transcript file. Returns number of removed lines."""
     if not os.path.exists(path):
         return 0
-    kept = []
-    removed = 0
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                data = json.loads(line)
-                idx = data.get("step_index")
-                if idx is not None and idx > cutoff_step:
-                    removed += 1
-                    continue
-                if idx is not None and idx == modify_step and not dry_run:
-                    content = data.get("content", "")
-                    data["content"] = update_transcript_content(content, old_str, new_str or "")
-                    if data.get("status") == "RUNNING":
-                        data["status"] = "DONE"
-                    if "completed_at" not in data or not data.get("completed_at"):
-                        data["completed_at"] = data.get("created_at")
-                    if "tool_calls" in data and isinstance(data["tool_calls"], list) and old_str:
-                        for tc in data["tool_calls"]:
-                            args = tc.get("args", {})
-                            if isinstance(args, dict):
-                                for k, v in args.items():
-                                    if isinstance(v, str) and old_str in v:
-                                        args[k] = v.replace(old_str, new_str or "")
-                    line = json.dumps(data, ensure_ascii=False) + "\n"
-                kept.append(line if line.endswith("\n") else line + "\n")
-            except Exception:
-                kept.append(line if line.endswith("\n") else line + "\n")
-
+        kept, removed = modify_or_truncate_lines(f, cutoff_step, modify_step, old_str, new_str, dry_run, whole_result)
     if not dry_run:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
     return removed
 
 
-def count_or_truncate_chunks(chunks_dir: str, target_step: int, dry_run: bool = False) -> tuple[int, int]:
-    """Truncates chunk files. Returns (removed_lines, deleted_files)."""
+def rewrite_chunks(chunks_dir: str, edit_lines, dry_run: bool = False) -> tuple[int, int]:
+    """
+    Applies edit_lines to a chunk folder. Antigravity cuts a transcript into pieces of exactly CHUNK_SIZE bytes,
+    so a piece can start in the middle of a line or even of a character. Only the whole folder, read in order,
+    is a list of lines, and it is written back cut the same way. Returns (removed_lines, deleted_files).
+    """
     if not os.path.isdir(chunks_dir):
         return 0, 0
-    total_removed = 0
-    deleted_files = 0
-    for chunk_file in glob.glob(os.path.join(chunks_dir, "*.jsonl")):
-        rem = count_or_truncate_jsonl(chunk_file, target_step, dry_run=dry_run)
-        total_removed += rem
-        if not dry_run:
-            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == 0:
+    files = sorted(glob.glob(os.path.join(chunks_dir, "*.jsonl")))
+    if not files:
+        return 0, 0
+    data = bytearray()
+    for chunk_file in files:
+        with open(chunk_file, "rb") as f:
+            data += f.read()
+    # surrogateescape carries damaged bytes through unchanged, as they may be a line still being written
+    text = bytes(data).decode("utf-8", errors="surrogateescape")
+    kept, removed = edit_lines(io.StringIO(text, newline="\n"))
+    new_data = "".join(kept).encode("utf-8", errors="surrogateescape")
+    pieces = [new_data[start:start + CHUNK_SIZE] for start in range(0, len(new_data), CHUNK_SIZE)]
+    deleted_files = max(0, len(files) - len(pieces))
+    if not dry_run and new_data != data:
+        names = [f"{number:08d}.jsonl" for number in range(len(pieces))]
+        for name, piece in zip(names, pieces):
+            with open(os.path.join(chunks_dir, name), "wb") as f:
+                f.write(piece)
+        for chunk_file in files:
+            if os.path.basename(chunk_file) not in names:
                 os.remove(chunk_file)
-                deleted_files += 1
-        else:
-            with open(chunk_file, "r", encoding="utf-8") as cf:
-                lines_in_chunk = sum(1 for l in cf if l.strip())
-            if lines_in_chunk > 0 and rem >= lines_in_chunk:
-                deleted_files += 1
-    return total_removed, deleted_files
+    return removed, deleted_files
+
+
+def count_or_truncate_chunks(chunks_dir: str, target_step: int, dry_run: bool = False) -> tuple[int, int]:
+    """Truncates chunk files. Returns (removed_lines, deleted_files)."""
+    return rewrite_chunks(chunks_dir, lambda lines: truncate_lines(lines, target_step), dry_run)
 
 
 def modify_or_truncate_chunks(chunks_dir: str, cutoff_step: int, modify_step: int = None,
-                              old_str: str = None, new_str: str = None, dry_run: bool = False) -> tuple[int, int]:
+                              old_str: str = None, new_str: str = None, dry_run: bool = False,
+                              whole_result: bool = False) -> tuple[int, int]:
     """Truncates chunk files keeping steps <= cutoff_step. Returns (removed_lines, deleted_files)."""
-    if not os.path.isdir(chunks_dir):
-        return 0, 0
-    total_removed = 0
-    deleted_files = 0
-    for chunk_file in glob.glob(os.path.join(chunks_dir, "*.jsonl")):
-        rem = modify_or_truncate_jsonl(chunk_file, cutoff_step, modify_step=modify_step,
-                                       old_str=old_str, new_str=new_str, dry_run=dry_run)
-        total_removed += rem
-        if not dry_run:
-            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == 0:
-                os.remove(chunk_file)
-                deleted_files += 1
-        else:
-            with open(chunk_file, "r", encoding="utf-8") as cf:
-                lines_in_chunk = sum(1 for l in cf if l.strip())
-            if lines_in_chunk > 0 and rem >= lines_in_chunk:
-                deleted_files += 1
-    return total_removed, deleted_files
+    return rewrite_chunks(
+        chunks_dir,
+        lambda lines: modify_or_truncate_lines(lines, cutoff_step, modify_step, old_str, new_str, dry_run, whole_result),
+        dry_run
+    )
 
 
 def count_or_filter_history(history_path: str, conv_id: str, cutoff_ms: int, rewound_prompts: set, dry_run: bool = False) -> int:
@@ -1032,6 +1059,54 @@ def prune_orphan_read_json(messages_dir: str) -> int:
     except Exception:
         pass
     return 0
+
+
+def purge_messages_after_cut(messages_dir: str, cutoff_ms: int | None, keep_file: str | None = None) -> int:
+    """
+    Removes message files written at or after the cut, and returns how many. read.json only records which messages
+    were read, so it stays, losing the entries of messages that were removed.
+    """
+    if not os.path.isdir(messages_dir) or cutoff_ms is None:
+        return 0
+    removed = 0
+    for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
+        if os.path.basename(m_path) == "read.json":
+            continue
+        if keep_file and os.path.abspath(m_path) == os.path.abspath(keep_file):
+            continue
+        try:
+            if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
+                os.remove(m_path)
+                removed += 1
+        except OSError:
+            pass
+    prune_orphan_read_json(messages_dir)
+    return removed
+
+
+def remove_future_subagents(base_dir: str, conv_id: str, last_kept_step: int, dry_run: bool = False) -> int:
+    """
+    Removes the records of subagents spawned after the cut, which for the rewound agent have not happened.
+    A record with no usable spawn step stays, because removing it would be a guess. Returns how many were removed.
+    """
+    subagents_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "subagents")
+    removed = 0
+    for path in glob.glob(os.path.join(subagents_dir, "*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                spawn_step = json.load(f).get("spawnStepIndex")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(spawn_step, int) and not isinstance(spawn_step, bool) and spawn_step > last_kept_step:
+            removed += 1
+            if not dry_run:
+                os.remove(path)
+    if removed:
+        if dry_run:
+            print(f"[DRY-RUN] Would remove {removed} record(s) of subagents spawned after this point.")
+        else:
+            print(f"  - Removed {removed} record(s) of subagents spawned after this point.")
+    return removed
 
 
 def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
@@ -1147,6 +1222,181 @@ def replace_in_bytes(data: bytes, old_bytes: bytes, new_bytes: bytes) -> tuple[b
         return data.replace(old_bytes, new_bytes), count
 
 
+# Parts of a tool result that never hold its text: step metadata, the tool call's arguments, labels, the type of a
+# wrapped message, the background task record, and the output file's path. A result can also wrap a copy of its
+# whole step, with its own metadata.
+RESULT_FIELDS_TO_KEEP = frozenset({
+    (5,), (133,), (147,), (148,),
+    (140, 1),
+    (140, 2, 3, 1), (140, 2, 3, 5), (140, 2, 3, 6), (140, 2, 3, 7), (140, 2, 3, 9),
+    (140, 2, 3, 10, 3, 1), (140, 2, 3, 10, 3, 2),
+    (140, 2, 6, 1), (140, 2, 6, 2, 5), (140, 2, 6, 2, 6), (140, 2, 6, 2, 7), (140, 2, 6, 2, 133), (140, 2, 6, 2, 147),
+    (140, 2, 7),
+    (114, 4, 1), (114, 4, 2), (114, 4, 3), (114, 4, 12, 1, 1),
+})
+
+# Fields holding the text of a tool result or message, in the formats found in real sessions. One step can have several.
+RESULT_TEXT_FIELDS = frozenset({
+    (14, 4),
+    (114, 1), (114, 2, 10, 1), (114, 4, 4),
+    (140, 2, 1),
+    (140, 2, 3, 10, 1),
+    (140, 2, 3, 10, 3, 4),
+    (140, 2, 6, 2, 14, 4),
+    (140, 2, 6, 2, 28, 21, 1),
+    (140, 2, 6, 2, 42, 5),
+})
+
+UUID_BYTES = re.compile(rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+# Note that file views put before their numbered lines. Everything from here to the end of its line is the note.
+LINE_NUMBER_NOTE = "The following code has been modified to include a line number before every line"
+NUMBERED_LINE = re.compile(r"(\d+):(?: (.*))?", re.DOTALL)
+
+
+def split_numbered_text(content: str) -> tuple[str, int, list[str], str] | None:
+    """
+    Splits a file view into the text up to its numbered lines, the first line's number, the lines without
+    their numbers, and the text after them. Returns None if the text has no numbered lines.
+    """
+    start = content.find(LINE_NUMBER_NOTE)
+    if start == -1:
+        return None
+    note_end = content.find("\n", start)
+    if note_end == -1:
+        return None
+    head = content[:note_end + 1]
+    lines = content[note_end + 1:].split("\n")
+    first_number = None
+    texts = []
+    for line in lines:
+        match = NUMBERED_LINE.fullmatch(line)
+        if not match:
+            break
+        if first_number is None:
+            first_number = int(match.group(1))
+        texts.append(match.group(2) or "")
+    if first_number is None:
+        return None
+    return head, first_number, texts, "\n".join(lines[len(texts):])
+
+
+def join_numbered_text(head: str, first_number: int, text: str, tail: str) -> str:
+    numbered = [f"{first_number + i}: {line}" for i, line in enumerate(text.split("\n"))]
+    return head + "\n".join(numbered) + "\n" + tail
+
+
+def replace_in_numbered_text(content: str, old_str: str, new_str: str) -> str | None:
+    """Replaces text in a file view, where text spanning lines is broken up by the numbers. None if absent."""
+    parts = split_numbered_text(content)
+    if parts is None:
+        return None
+    head, first_number, texts, tail = parts
+    raw = "\n".join(texts)
+    if old_str not in raw:
+        return None
+    return join_numbered_text(head, first_number, raw.replace(old_str, new_str), tail)
+
+
+def tool_argument_values(payload: bytes) -> set[bytes]:
+    """Returns the values of the tool call's arguments in Field 140.1, which result records repeat word for word."""
+    values = set()
+    try:
+        for fn, wt, val in parse_fields(payload):
+            if fn == 140 and wt == 2:
+                for sfn, swt, sval in parse_fields(val):
+                    if sfn == 1 and swt == 2:
+                        values.update(kval for kfn, kwt, kval in parse_fields(sval) if kfn == 2 and kwt == 2)
+    except ValueError:
+        pass
+    return values
+
+
+def replace_in_result(data: bytes, old_bytes: bytes, new_bytes: bytes, path: tuple[int, ...] = (),
+                      arguments: set[bytes] = None, alternatives: list[tuple[bytes, bytes]] = ()) -> tuple[bytes, int]:
+    """
+    Replaces text in a tool result or message, recalculating the lengths around it. Metadata, identifiers and copies
+    of the call's arguments stay as they are, or a short search text such as "1" would rewrite the conversation ID
+    without changing what the agent was told. Alternatives are other (old, new) pairs for fields holding a differently
+    encoded copy. A field uses only the first pair it holds, so new text is never replaced again.
+    """
+    pairs = [pair for pair in [(old_bytes, new_bytes), *alternatives] if pair[0]]
+    if not pairs:
+        return data, 0
+    if arguments is None:
+        arguments = tool_argument_values(data)
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        for old, new in pairs:
+            if old in data:
+                return data.replace(old, new), data.count(old)
+        return data, 0
+
+    new_fields = []
+    total_count = 0
+    for fn, wt, val in fields:
+        here = path + (fn,)
+        if wt == 2 and here not in RESULT_FIELDS_TO_KEEP and not UUID_BYTES.fullmatch(val):
+            count = 0
+            if here == (140, 2, 1):
+                numbered = None
+                try:
+                    numbered = replace_in_numbered_text(val.decode("utf-8"), old_bytes.decode("utf-8"), new_bytes.decode("utf-8"))
+                except UnicodeDecodeError:
+                    pass
+                if numbered is not None:
+                    val = numbered.encode("utf-8")
+                    count = 1
+            if count == 0:
+                pair = next((pair for pair in pairs if pair[0] in val), None)
+                if pair and here in RESULT_TEXT_FIELDS:
+                    count = val.count(pair[0])
+                    val = val.replace(*pair)
+                elif pair and val not in arguments:
+                    val, count = replace_in_result(val, old_bytes, new_bytes, here, arguments, alternatives)
+            total_count += count
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields), total_count
+
+
+def set_result_text(data: bytes, new_text: str, path: tuple[int, ...] = ()) -> tuple[bytes, int]:
+    """
+    Replaces the whole text of a tool result in every field known to hold it. Copies of the text differ in format,
+    so searching for one copy would leave the others unchanged. Returns the new bytes and the number of fields set.
+    """
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        return data, 0
+
+    new_fields = []
+    total_count = 0
+    for fn, wt, val in fields:
+        here = path + (fn,)
+        if wt == 2:
+            if here in RESULT_TEXT_FIELDS:
+                parts = split_numbered_text(val.decode("utf-8", errors="ignore"))
+                if here == (140, 2, 1) and parts:
+                    val = join_numbered_text(parts[0], parts[1], new_text, parts[3]).encode("utf-8")
+                else:
+                    val = new_text.encode("utf-8")
+                total_count += 1
+            elif any(field[:len(here)] == here for field in RESULT_TEXT_FIELDS):
+                val, count = set_result_text(val, new_text, here)
+                total_count += count
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields), total_count
+
+
+def check_replacement_pair(step: int, replace_old: str | None, replace_new: str | None) -> None:
+    """Half of a replacement cannot be applied, and later steps must not be deleted for a change that never happens."""
+    if replace_old and not replace_new:
+        raise ValueError(f"The replacement text is empty, so step {step} would not change. Nothing was changed.")
+    if replace_new and not replace_old:
+        raise ValueError("--replace-new needs --replace-old, the text to search for. Nothing was changed.")
+
+
 def find_field_14_4(data: bytes) -> str | None:
     """Extracts raw view_file text from protobuf payload (Field 14.4)."""
     try:
@@ -1166,195 +1416,213 @@ def find_field_14_4(data: bytes) -> str | None:
     return None
 
 
+def read_field(data: bytes, path: tuple[int, ...]) -> bytes | None:
+    """Returns the first value at a field path, or None if the path is absent or the data does not parse."""
+    for number in path:
+        try:
+            data = next(val for fn, wt, val in parse_fields(data) if fn == number and wt == 2)
+        except (ValueError, StopIteration):
+            return None
+    return data
+
+
 def find_field_140_2(data: bytes) -> str | None:
-    """Extracts raw tool observation text from protobuf payload (Field 140.2)."""
-    try:
-        fields = parse_fields(data)
-        for fn, wt, val in fields:
-            if fn == 140 and wt == 2 and isinstance(val, bytes):
-                sub = parse_fields(val)
-                for sfn, swt, sval in sub:
-                    if sfn == 2 and swt == 2 and isinstance(sval, bytes):
-                        try:
-                            nested = parse_fields(sval)
-                            for nfn, nwt, nval in nested:
-                                if isinstance(nval, bytes):
-                                    return nval.decode("utf-8", errors="ignore")
-                        except Exception:
-                            pass
-                        return sval.decode("utf-8", errors="ignore")
-            elif wt == 2 and isinstance(val, bytes):
-                res = find_field_140_2(val)
-                if res:
-                    return res
-    except Exception:
-        pass
+    """Extracts the text of a tool result from Field 140.2. Other bytes there are nested messages, not text."""
+    for path in ((140, 2, 1), (140, 2, 3, 10, 3, 4), (140, 2, 3, 10, 1)):
+        text = read_field(data, path)
+        if text:
+            return text.decode("utf-8", errors="ignore")
     return None
 
 
-def update_command_result_payload(
-    orig_payload: bytes,
-    exit_code: int | None = None,
-    error_output: str | None = None,
-    old_output: str | None = None,
-    new_output: str | None = None,
-    strip_background: bool = False
-) -> tuple[bytes, bool]:
+def command_result_text(original: bytes | None, exit_code: int, output: str | None) -> str:
+    """Words a simulated result the way the session's real results are worded, so the format gives nothing away."""
+    if original and original.startswith(b"Command "):
+        first_line = f"Command exited with code {exit_code}."
+        return f"{first_line}\n\nCommand output:\n{output.strip()}\n" if output else f"{first_line}\n"
+    if output:
+        return f"\nThe command exited with code {exit_code}.\nOutput:\n{output.strip()}\r\n\n"
+    return f"\nThe command exited with code {exit_code}.\r\n\n"
+
+
+def set_command_record(record: bytes, exit_code: int, output: str) -> bytes:
+    """Sets the exit code (3) and output (4) of a command record, whose fields 1 and 2 are the command and its folder."""
+    seen = set()
+    new_record = []
+    for rfn, rwt, rval in parse_fields(record):
+        seen.add(rfn)
+        if rfn == 3:
+            new_record.append((3, 0, exit_code))
+        elif rfn == 4:
+            new_record.append((4, 2, output.encode("utf-8")))
+        else:
+            new_record.append((rfn, rwt, rval))
+    if 3 not in seen:
+        new_record.append((3, 0, exit_code))
+    if 4 not in seen and output:
+        new_record.append((4, 2, output.encode("utf-8")))
+    return serialize_fields(new_record)
+
+
+# steps.render_info holds what Antigravity displays for a result. For a command it is the same record as Field 140.2.3
+# of the result, so the result's field paths apply to it from there. The agent does not read it.
+RENDER_INFO_PATH = (140, 2, 3)
+
+
+def update_render_record(render_info: bytes, exit_code: int, output: str) -> bytes:
+    """Sets the exit code and output of the command record in a display copy, at Field 10.3."""
+    new_fields = []
+    for fn, wt, val in parse_fields(render_info):
+        if fn == 10 and wt == 2:
+            val = serialize_fields([(sfn, swt, set_command_record(sval, exit_code, output) if sfn == 3 and swt == 2 else sval)
+                                    for sfn, swt, sval in parse_fields(val)])
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields)
+
+
+def update_render_info(cur: sqlite3.Cursor, step: int, change) -> None:
+    """Applies the change made to a result to its display copy as well, if the step has one in a readable layout."""
+    if "render_info" not in {row[1] for row in cur.execute("PRAGMA table_info(steps)").fetchall()}:
+        return
+    row = cur.execute("SELECT render_info FROM steps WHERE idx = ?", (step,)).fetchone()
+    if not row or not isinstance(row[0], bytes) or not row[0]:
+        return
+    try:
+        parse_fields(row[0])
+        new_value = change(row[0])
+    except ValueError:
+        return
+    if new_value != row[0]:
+        cur.execute("UPDATE steps SET render_info = ? WHERE idx = ?", (new_value, step))
+
+
+def update_command_result_payload(orig_payload: bytes, exit_code: int, error_output: str | None = None,
+                                  strip_background: bool = False) -> tuple[bytes, bool]:
     """
-    Updates the protobuf step_payload of a command execution (run_command / send_command_input).
+    Rewrites the protobuf step_payload of a command (run_command / send_command_input) as a finished run:
     - If strip_background is True, strips top-level Field 148 (BackgroundTaskInfo), converting
       a background task launch into a completed synchronous result.
-    - Updates Field 140.2.1 observation string to reflect the exit code and error output (or performs replacement).
-    - Updates Field 140.2.6 Any (gemini_coder.Step -> CortexStepRunCommand / Field 28):
-      - Field 6 (ExitCode) is updated if exit_code is provided.
-      - Field 21 (CombinedOutput) is updated or replaced.
-      - Field 11 is set to 1 (marking execution complete).
+    - Sets Field 140.2.1 (observation text) to report the exit code and output.
+    - Updates the command record, which is either Field 140.2.3.10.3 (3: exit code, 4: output), or
+      Field 140.2.6 Any (gemini_coder.Step -> CortexStepRunCommand / Field 28), where Field 6 is the exit code,
+      Field 21 the output, and Field 11 marks the run as complete.
     """
+    output = error_output.strip() if error_output else ""
+    modified = False
+
+    def update_any(any_bytes: bytes) -> bytes:
+        nonlocal modified
+        any_fields = parse_fields(any_bytes)
+        new_any = []
+        for afn, awt, aval in any_fields:
+            if afn == 2 and awt == 2:
+                new_step = []
+                for st_fn, st_wt, st_val in parse_fields(aval):
+                    if st_fn == 28 and st_wt == 2:
+                        out_bytes = serialize_fields([(1, 2, (output + "\r\n").encode("utf-8"))]) if output else b""
+                        seen = set()
+                        new_cmd = []
+                        for cfn, cwt, cval in parse_fields(st_val):
+                            seen.add(cfn)
+                            if cfn == 6:
+                                new_cmd.append((6, 0, exit_code))
+                            elif cfn == 21:
+                                new_cmd.append((21, 2, out_bytes))
+                            elif cfn == 11:
+                                new_cmd.append((11, 0, 1))
+                            else:
+                                new_cmd.append((cfn, cwt, cval))
+                        if 6 not in seen:
+                            new_cmd.append((6, 0, exit_code))
+                        if 11 not in seen:
+                            new_cmd.append((11, 0, 1))
+                        if 21 not in seen and output:
+                            new_cmd.append((21, 2, out_bytes))
+                        st_val = serialize_fields(new_cmd)
+                        modified = True
+                    new_step.append((st_fn, st_wt, st_val))
+                aval = serialize_fields(new_step)
+            new_any.append((afn, awt, aval))
+        return serialize_fields(new_any)
+
+    def update_record(record: bytes) -> bytes:
+        nonlocal modified
+        modified = True
+        return set_command_record(record, exit_code, output)
+
     try:
-        top_fields = parse_fields(orig_payload)
+        original_text = read_field(orig_payload, (140, 2, 1))
+        new_text = command_result_text(original_text, exit_code, output)
         new_top = []
-        modified = False
-        for fn, wt, val in top_fields:
+        for fn, wt, val in parse_fields(orig_payload):
             if fn == 148 and strip_background:
                 modified = True
                 continue
-            if fn == 140 and wt == 2 and isinstance(val, bytes):
-                f140_fields = parse_fields(val)
+            if fn == 140 and wt == 2:
                 new_f140 = []
-                for sfn, swt, sval in f140_fields:
-                    if sfn == 2 and swt == 2 and isinstance(sval, bytes):
-                        sub2_fields = parse_fields(sval)
+                for sfn, swt, sval in parse_fields(val):
+                    if sfn == 2 and swt == 2:
                         new_sub2 = []
-                        for s2fn, s2wt, s2val in sub2_fields:
-                            if s2fn == 1 and s2wt == 2 and isinstance(s2val, bytes):
-                                if exit_code is not None:
-                                    if error_output:
-                                        obs = f"\nThe command exited with code {exit_code}.\nOutput:\n{error_output.strip()}\r\n\n"
-                                    else:
-                                        obs = f"\nThe command exited with code {exit_code}.\r\n\n"
-                                    new_sub2.append((s2fn, s2wt, obs.encode("utf-8")))
-                                    modified = True
-                                elif old_output and new_output and old_output.encode("utf-8") in s2val:
-                                    new_s2val = s2val.replace(old_output.encode("utf-8"), new_output.encode("utf-8"))
-                                    new_sub2.append((s2fn, s2wt, new_s2val))
-                                    modified = True
-                                elif old_output and new_output and old_output.strip().encode("utf-8") in s2val:
-                                    new_s2val = s2val.replace(old_output.strip().encode("utf-8"), new_output.strip().encode("utf-8"))
-                                    new_sub2.append((s2fn, s2wt, new_s2val))
-                                    modified = True
-                                else:
-                                    new_sub2.append((s2fn, s2wt, s2val))
-                            elif s2fn == 6 and s2wt == 2 and isinstance(s2val, bytes):
+                        for s2fn, s2wt, s2val in parse_fields(sval):
+                            if s2fn == 1 and s2wt == 2:
+                                s2val = new_text.encode("utf-8")
+                                modified = True
+                            elif s2fn == 3 and s2wt == 2:
+                                new_s3 = []
+                                for s3fn, s3wt, s3val in parse_fields(s2val):
+                                    if s3fn == 10 and s3wt == 2:
+                                        new_s10 = []
+                                        for tfn, twt, tval in parse_fields(s3val):
+                                            new_s10.append((tfn, twt, update_record(tval) if tfn == 3 and twt == 2 else tval))
+                                        s3val = serialize_fields(new_s10)
+                                    new_s3.append((s3fn, s3wt, s3val))
+                                s2val = serialize_fields(new_s3)
+                            elif s2fn == 6 and s2wt == 2:
                                 try:
-                                    any_fields = parse_fields(s2val)
-                                    type_url = None
-                                    step_data = None
-                                    for afn, awt, aval in any_fields:
-                                        if afn == 1 and awt == 2:
-                                            type_url = aval
-                                        elif afn == 2 and awt == 2:
-                                            step_data = aval
-                                    if type_url and step_data:
-                                        st_fields = parse_fields(step_data)
-                                        new_st = []
-                                        for st_fn, st_wt, st_val in st_fields:
-                                            if st_fn == 28 and st_wt == 2 and isinstance(st_val, bytes):
-                                                cmd_fields = parse_fields(st_val)
-                                                new_cmd = []
-                                                has_f6 = False
-                                                has_f11 = False
-                                                has_f21 = False
-                                                out_bytes = serialize_fields([(1, 2, (error_output.strip() + "\r\n").encode("utf-8"))]) if error_output else b""
-                                                for cfn, cwt, cval in cmd_fields:
-                                                    if cfn == 6 and exit_code is not None:
-                                                        has_f6 = True
-                                                        new_cmd.append((cfn, 0, exit_code))
-                                                    elif cfn == 21:
-                                                        has_f21 = True
-                                                        if exit_code is not None:
-                                                            new_cmd.append((cfn, 2, out_bytes))
-                                                        elif old_output and new_output and isinstance(cval, bytes):
-                                                            try:
-                                                                sub_c = parse_fields(cval)
-                                                                new_sub_c = []
-                                                                sub_mod = False
-                                                                for sc_fn, sc_wt, sc_val in sub_c:
-                                                                    if sc_fn == 1 and isinstance(sc_val, bytes):
-                                                                        if old_output.encode("utf-8") in sc_val:
-                                                                            sc_val = sc_val.replace(old_output.encode("utf-8"), new_output.encode("utf-8"))
-                                                                            sub_mod = True
-                                                                        elif old_output.strip().encode("utf-8") in sc_val:
-                                                                            sc_val = sc_val.replace(old_output.strip().encode("utf-8"), new_output.strip().encode("utf-8"))
-                                                                            sub_mod = True
-                                                                    new_sub_c.append((sc_fn, sc_wt, sc_val))
-                                                                if sub_mod:
-                                                                    new_cmd.append((cfn, 2, serialize_fields(new_sub_c)))
-                                                                    modified = True
-                                                                else:
-                                                                    new_cmd.append((cfn, cwt, cval))
-                                                            except Exception:
-                                                                new_cmd.append((cfn, cwt, cval))
-                                                        else:
-                                                            new_cmd.append((cfn, cwt, cval))
-                                                    elif cfn == 11 and exit_code is not None:
-                                                        has_f11 = True
-                                                        new_cmd.append((cfn, 0, 1))
-                                                    else:
-                                                        new_cmd.append((cfn, cwt, cval))
-                                                if exit_code is not None:
-                                                    if not has_f6:
-                                                        new_cmd.append((6, 0, exit_code))
-                                                    if not has_f11:
-                                                        new_cmd.append((11, 0, 1))
-                                                    if not has_f21 and error_output:
-                                                        new_cmd.append((21, 2, out_bytes))
-                                                new_st.append((st_fn, st_wt, serialize_fields(new_cmd)))
-                                                if exit_code is not None:
-                                                    modified = True
-                                            else:
-                                                new_st.append((st_fn, st_wt, st_val))
-                                        new_any = [(1, 2, type_url), (2, 2, serialize_fields(new_st))]
-                                        new_sub2.append((s2fn, s2wt, serialize_fields(new_any)))
-                                    else:
-                                        new_sub2.append((s2fn, s2wt, s2val))
-                                except Exception:
-                                    new_sub2.append((s2fn, s2wt, s2val))
-                            else:
-                                new_sub2.append((s2fn, s2wt, s2val))
-                        new_f140.append((sfn, swt, serialize_fields(new_sub2)))
-                    else:
-                        new_f140.append((sfn, swt, sval))
-                new_top.append((fn, wt, serialize_fields(new_f140)))
-            else:
-                new_top.append((fn, wt, val))
+                                    s2val = update_any(s2val)
+                                except ValueError:
+                                    pass
+                            new_sub2.append((s2fn, s2wt, s2val))
+                        sval = serialize_fields(new_sub2)
+                    new_f140.append((sfn, swt, sval))
+                val = serialize_fields(new_f140)
+            new_top.append((fn, wt, val))
         return serialize_fields(new_top), modified
-    except Exception:
+    except ValueError:
         return orig_payload, False
 
 
-def update_transcript_content(content: str, old_str: str, new_str: str) -> str:
-    """Replaces content in transcript log line, handling both substring replacement and formatted code block replacement."""
-    if old_str and old_str in content:
-        return content.replace(old_str, new_str)
+def update_transcript_content(content: str, old_str: str, new_str: str, whole_result: bool = False) -> str:
+    """
+    Replaces content in a transcript line. With whole_result, new_str replaces the entire result, whatever old_str
+    holds, keeping the timestamps and file view layout around it. Otherwise only old_str is replaced, if present.
+    """
+    if not whole_result:
+        numbered = replace_in_numbered_text(content, old_str, new_str) if old_str else None
+        if numbered is not None:
+            return numbered
+        if old_str and old_str in content:
+            return content.replace(old_str, new_str)
+        if old_str and old_str.strip() in content:
+            return content.replace(old_str.strip(), (new_str or "").strip())
+        return content
 
-    if "Tool is running as a background task" in content:
+    parts = split_numbered_text(content)
+    if parts:
+        return join_numbered_text(parts[0], parts[1], new_str, parts[3])
+    if BACKGROUND_LAUNCH.match(content):
+        # A launch has no completion time yet, and is now shown as a finished result
         m_created = re.search(r"Created At: ([^\n]+)", content)
         created_str = m_created.group(1) if m_created else datetime.now(timezone.utc).isoformat()
         m_comp = re.search(r"Completed At: ([^\n]+)", content)
         comp_str = m_comp.group(1) if m_comp else created_str
         return f"Created At: {created_str}\nCompleted At: {comp_str}\n\n{new_str.strip()}\n"
-
-    marker = "The following code has been modified to include a line number before every line, in the format: <line_number>: <original_line>. Please note that any changes targeting the original code should remove the line number, colon, and leading space."
-    if marker in content:
-        header, _ = content.split(marker, 1)
-        new_lines = new_str.split("\n")
-        formatted = [f"{i+1}: {line}" for i, line in enumerate(new_lines)]
-        return header + marker + "\n" + "\n".join(formatted) + "\n"
-
+    if old_str and old_str in content:
+        return content.replace(old_str, new_str)
     if old_str and old_str.strip() in content:
         return content.replace(old_str.strip(), (new_str or "").strip())
-
-    return content.replace(old_str, new_str) if old_str else new_str
+    header = re.match(r"Created At: [^\n]*\n(?:Completed At: [^\n]*\n)?\n*", content)
+    return (header.group(0) if header else "") + new_str
 
 
 READ_TOOLS = {"view_file", "read_file", "list_dir", "list_directory", "grep_search", "find_by_name"}
@@ -1741,13 +2009,11 @@ def build_inquiry_answer(questions: list[dict], choice_spec: str = None, write_i
 
     choice_map = {}
     if choice_spec:
-        if "=" in choice_spec:
-            parts = [p.strip() for p in choice_spec.split(",") if p.strip()]
-            for p in parts:
-                if "=" in p:
-                    k, v = p.split("=", 1)
-                    k_num = re.sub(r"^[Qq]", "", k.strip())
-                    choice_map[int(k_num)] = v.strip()
+        if re.match(r"\s*[Qq]?\d+\s*=", choice_spec):
+            # A comma separates questions only when a question number follows it: in 1=1,3,2=2 question 1 gets 1,3
+            for part in re.split(r",\s*(?=[Qq]?\d+\s*=)", choice_spec):
+                k, v = part.split("=", 1)
+                choice_map[int(re.sub(r"^[Qq]", "", k.strip()))] = v.strip()
         elif len(questions) == 1:
             choice_map[1] = choice_spec.strip()
         else:
@@ -1764,17 +2030,25 @@ def build_inquiry_answer(questions: list[dict], choice_spec: str = None, write_i
     write_in_map = {}
     if write_in_spec:
         if "=" in write_in_spec and any(write_in_spec.startswith(f"{i}=") or write_in_spec.startswith(f"Q{i}=") for i in range(1, len(questions) + 1)):
-            pattern = re.findall(r"(?:^|,|\s*)([Qq]?\d+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^,]*))", write_in_spec)
+            # An unquoted answer runs up to the next question number, so it can hold commas, equals signs and newlines
+            pattern = re.findall(
+                r"""([Qq]?\d+)\s*=\s*(?:"([^"]*)"|'([^']*)'|(.*?))\s*(?=[,\s]\s*[Qq]?\d+\s*=|\Z)""",
+                write_in_spec,
+                re.DOTALL
+            )
             for m in pattern:
                 k_num = int(re.sub(r"^[Qq]", "", m[0]))
-                val = m[1] or m[2] or m[3]
-                write_in_map[k_num] = val.strip()
+                write_in_map[k_num] = m[1] or m[2] or m[3]
         elif len(questions) == 1:
             write_in_map[1] = write_in_spec.strip()
         else:
             raise ValueError(
                 "Multi-question step requires mapped write-in syntax, e.g. --write-in 1=\"Answer 1\" 2=\"Answer 2\"."
             )
+
+    for number in sorted(set(choice_map) | set(write_in_map)):
+        if not 1 <= number <= len(questions):
+            raise ValueError(f"Question {number} does not exist: this step has {len(questions)} question(s).")
 
     answers = []
     resolved_selections = {}
@@ -1817,6 +2091,8 @@ def build_inquiry_answer(questions: list[dict], choice_spec: str = None, write_i
                 selected_labels.append(str(label))
                 selected_ids.append(str(opt_num))
 
+            if not selected_labels:
+                raise ValueError(f"No choice given for Question {q_idx}.")
             if not is_multi and len(selected_labels) > 1:
                 raise ValueError(
                     f"Question {q_idx} does not allow multi-select (got multiple choices: {c_val})."
@@ -1899,22 +2175,27 @@ def update_inquiry_entries(data: bytes, questions: list[dict], resolved_selectio
 def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int = None,
                             old_str: str = None, new_str: str = None,
                             new_web_content: str = None, delete_web_content: bool = False,
-                            dry_run: bool = False) -> tuple[int, int, int]:
+                            dry_run: bool = False, whole_result: bool = False) -> tuple[int, int, int]:
     """
     Prunes step artifact directories (brain/<conv_id>/.system_generated/steps/<idx>)
     where idx > cutoff_step (or idx >= cutoff_step if modify_step is None).
     If modify_step is provided:
-      - updates output.txt in steps/<modify_step>/ (or replaces old_str with new_str).
+      - replaces old_str with new_str in output.txt in steps/<modify_step>/, if it holds old_str.
+      - if whole_result is True, new_str replaces the whole of output.txt, creating it if needed.
       - if new_web_content is provided, writes it to steps/<modify_step>/content.md.
       - if delete_web_content is True, removes steps/<modify_step>/content.md.
     Returns (purged_dirs_count, modified_files_count, deleted_files_count).
     """
+    # A replaced web page has to be written, or the command would report a change it never made
+    if steps_dir and new_web_content is not None and not dry_run:
+        os.makedirs(steps_dir, exist_ok=True)
     if not steps_dir or not os.path.isdir(steps_dir):
         return 0, 0, 0
 
     purged_dirs = 0
     modified_files = 0
     deleted_files = 0
+    whole_result = bool(new_str) and (whole_result or not old_str)
 
     for entry in sorted(os.listdir(steps_dir)):
         dir_path = os.path.join(steps_dir, entry)
@@ -1959,26 +2240,21 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
                 try:
                     with open(out_path, "r", encoding="utf-8", newline="") as f:
                         content = f.read()
-                    if old_str and old_str in content:
+                    new_content = None
+                    if whole_result:
+                        new_content = new_str
+                    elif old_str and old_str in content:
                         new_content = content.replace(old_str, new_str or "")
-                        modified_files += 1
-                        if not dry_run:
-                            with open(out_path, "w", encoding="utf-8", newline="") as f:
-                                f.write(new_content)
-                    elif old_str and old_str.strip() in content:
+                    elif old_str and old_str.strip() and old_str.strip() in content:
                         new_content = content.replace(old_str.strip(), (new_str or "").strip())
+                    if new_content is not None:
                         modified_files += 1
                         if not dry_run:
                             with open(out_path, "w", encoding="utf-8", newline="") as f:
                                 f.write(new_content)
-                    elif new_str:
-                        modified_files += 1
-                        if not dry_run:
-                            with open(out_path, "w", encoding="utf-8", newline="") as f:
-                                f.write(new_str)
                 except Exception:
                     pass
-            elif not os.path.exists(out_path) and new_str:
+            elif whole_result:
                 modified_files += 1
                 if not dry_run:
                     try:
@@ -1997,8 +2273,8 @@ def sync_or_prune_step_dirs(steps_dir: str, cutoff_step: int, modify_step: int =
                     with open(os.path.join(modify_dir, "content.md"), "w", encoding="utf-8") as f:
                         f.write(new_web_content)
                     modified_files += 1
-                if new_str:
-                    with open(os.path.join(modify_dir, "output.txt"), "w", encoding="utf-8") as f:
+                if whole_result:
+                    with open(os.path.join(modify_dir, "output.txt"), "w", encoding="utf-8", newline="") as f:
                         f.write(new_str)
                     modified_files += 1
             except Exception:
@@ -2043,8 +2319,9 @@ def detect_step_info(base_dir: str, conv_id: str, step_idx: int) -> tuple[str, s
     if step_type == 101:
         # Step type 101 represents SYSTEM_MESSAGE / subagent report / background task notification
         sender = None
+        msg_id = None
         if payload:
-            _, p_sender, _ = extract_subagent_msg_info(payload)
+            msg_id, p_sender, _ = extract_subagent_msg_info(payload)
             if p_sender and p_sender != conv_id and p_sender != "system":
                 sender = p_sender
             if not sender:
@@ -2086,24 +2363,16 @@ def detect_step_info(base_dir: str, conv_id: str, step_idx: int) -> tuple[str, s
                 if sender:
                     break
 
-        if not sender:
-            msgs_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "messages")
-            if os.path.isdir(msgs_dir):
-                for mf in glob.glob(os.path.join(msgs_dir, "*.json")):
-                    if os.path.basename(mf) == "read.json":
-                        continue
-                    try:
-                        with open(mf, "r", encoding="utf-8") as f:
-                            md = json.load(f)
-                            snd = md.get("sender")
-                            if snd and "task-" in snd:
-                                sender = snd
-                                break
-                            if snd and snd != "system" and snd != conv_id and len(snd) == 36:
-                                sender = snd
-                                break
-                    except Exception:
-                        pass
+        # Only this step's own message file can identify it. Any other file belongs to a different message.
+        if not sender and msg_id:
+            own_file = os.path.join(base_dir, "brain", conv_id, ".system_generated", "messages", f"{msg_id}.json")
+            try:
+                with open(own_file, "r", encoding="utf-8") as f:
+                    file_sender = json.load(f).get("sender")
+            except (OSError, ValueError, AttributeError):
+                file_sender = None
+            if file_sender and file_sender != conv_id and file_sender != "system":
+                sender = file_sender
 
         if sender:
             if "task-" in sender:
@@ -2284,6 +2553,7 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
         print(f"[DRY-RUN] Rewind target: {target_desc}")
         print(f"[DRY-RUN] Steps remaining: {remaining_steps}")
         print(f"[DRY-RUN] Steps to be deleted from DB: {steps_to_delete}")
+        remove_future_subagents(src_dir, src_cid, target_step - 1, dry_run=True)
         print(f"[DRY-RUN] gen_metadata / executor_metadata turns remaining: {remaining_model_turns}")
         if parent_refs_to_delete:
             print(f"[DRY-RUN] parent_references entries to be deleted: {parent_refs_to_delete}")
@@ -2338,6 +2608,15 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
                     raw_summary = NULL
                 WHERE conversation_id = ?
             """, (remaining_steps, last_user_input, conv_id))
+            # An earlier command may have marked the session as running, and nothing is running now
+            columns = {row[1] for row in s_cur.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+            if {"status", "not_fully_idle"} <= columns:
+                s_cur.execute("""
+                    UPDATE conversation_summaries
+                    SET status = 'CASCADE_RUN_STATUS_IDLE',
+                        not_fully_idle = 0
+                    WHERE conversation_id = ?
+                """, (conv_id,))
         s_conn.commit()
         s_conn.close()
 
@@ -2362,19 +2641,11 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
             pass
 
     # 7. Remove system messages generated at or after cutoff
-    messages_removed = 0
-    if os.path.isdir(messages_dir) and cutoff_ms is not None:
-        for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-            try:
-                if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                    os.remove(m_path)
-                    messages_removed += 1
-            except OSError:
-                pass
-        prune_orphan_read_json(messages_dir)
+    messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
 
     # 8. Prune post-rewind step output artifact directories
     steps_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, dry_run=False)
+    remove_future_subagents(base_dir, conv_id, target_step - 1)
 
     # 9. Prune post-rewind background task logs
     tasks_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "tasks")
@@ -2402,14 +2673,16 @@ def execute_rewind(base_dir: str, conv_id: str, target_step: int, dry_run: bool 
     print(f"  {resume_command(base_dir, conv_id)}")
 
 
-def is_background_launch(payload: bytes | None) -> bool:
-    """Tells a command result that started a background task apart from output that merely mentions one."""
-    if not payload:
-        return False
-    if b"background task" in payload:
-        return True
+# How the result of a real background launch starts. Output that merely mentions a task does not start this way.
+BACKGROUND_LAUNCH = re.compile(
+    r"(?:Created At: [^\n]*\n)?(?:Completed At: [^\n]*\n)?\n*Tool is running as a background task with task id: \S*?(task-\d+)"
+)
+
+
+def has_background_record(payload: bytes | None) -> bool:
+    """Tells whether a result holds Field 148, the record of a background task. Many real launches have none."""
     try:
-        return any(fn == 148 for fn, _, _ in parse_fields(payload))
+        return any(fn == 148 for fn, _, _ in parse_fields(payload or b""))
     except ValueError:
         return False
 
@@ -2444,22 +2717,15 @@ def find_last_result_step(cur: sqlite3.Cursor, transcript_path: str, call_step: 
 
 def find_launched_task(transcript_path: str, result_step: int, payload: bytes | None) -> str | None:
     """Returns the background task a command result started, or None if the result started none."""
-    if not is_background_launch(payload):
+    content = extract_content_from_transcript(transcript_path, result_step) or ""
+    match = BACKGROUND_LAUNCH.match(content)
+    if match:
+        return match.group(1)
+    if not has_background_record(payload):
         return None
-    if os.path.exists(transcript_path):
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if record.get("step_index") == result_step:
-                    match = re.search(r"task-(\d+)", record.get("content", ""))
-                    if match:
-                        return f"task-{match.group(1)}"
-                    break
+    match = re.search(r"task-(\d+)", content)
+    if match:
+        return f"task-{match.group(1)}"
     match = re.search(rb"task-(\d+)", payload)
     return f"task-{match.group(1).decode('utf-8')}" if match else None
 
@@ -2608,10 +2874,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
                 except Exception:
                     pass
 
-            if err_text:
-                new_str = f"The command exited with code {err_code}.\nOutput:\n{err_text.strip()}"
-            else:
-                new_str = f"The command exited with code {err_code}."
+            new_str = command_result_text(read_field(orig_payload, (140, 2, 1)), err_code, err_text).strip()
             err_detail = f"exit code {err_code}" + (f": {err_text.strip()}" if err_text else "")
         else:
             target_url = extract_url_from_step(source_base_dir or base_dir, src_cid, target_step, result_step, orig_payload)
@@ -2639,6 +2902,23 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     elif replace_text:
         new_str = replace_text
 
+    # The agent reads the stored result, which real sessions fill with the page as well as a pointer to content.md.
+    # So the page saved in content.md is looked for there and replaced. A result without it, such as one holding
+    # only the pointer, is left alone: the agent reaches the page through content.md, and its layout is unknown.
+    page_in_result = False
+    if web_content_text is not None and not old_str and not new_str:
+        saved_page_file = os.path.join(steps_dir, str(result_step), "content.md")
+        if not os.path.exists(saved_page_file) and source_base_dir:
+            saved_page_file = os.path.join(source_base_dir, "brain", src_cid, ".system_generated", "steps", str(result_step), "content.md")
+        saved_page = None
+        if os.path.exists(saved_page_file):
+            with open(saved_page_file, "r", encoding="utf-8", newline="") as f:
+                saved_page = f.read()
+        if saved_page and replace_in_result(orig_payload, saved_page.encode("utf-8"), web_content_text.encode("utf-8"))[1]:
+            old_str = saved_page
+            new_str = web_content_text
+            page_in_result = True
+
     if not old_str and not new_str and web_content_text is None:
         conn.close()
         raise ValueError(
@@ -2651,9 +2931,12 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         conn.close()
         raise ValueError(f"The replacement text is empty, so step {result_step} would not change. Nothing was changed.")
 
-    # If old_str was not specified and we have new_str to substitute into payload:
+    # Without a search text, the new text replaces the whole result
+    whole_result = not replace_old and not page_in_result
     count = 0
     new_payload = orig_payload
+    # The same change, for the result's display copy in steps.render_info
+    render_change = None
     if new_str:
         if not old_str:
             extracted = None
@@ -2690,51 +2973,39 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
             if extracted:
                 old_str = extracted
-            else:
+
+        if tool_name in COMMAND_TOOLS and simulate_error is not None:
+            has_f148 = False
+            try:
+                has_f148 = any(fn == 148 for fn, wt, val in parse_fields(orig_payload))
+            except Exception:
+                pass
+            new_payload, proto_mod = update_command_result_payload(
+                orig_payload,
+                exit_code=err_code,
+                error_output=err_text if err_text is not None else "",
+                strip_background=bool(bg_task_id) or has_f148
+            )
+            if proto_mod:
+                count += 1
+                render_change = lambda data: update_render_record(data, err_code, (err_text or "").strip())
+        elif whole_result:
+            new_payload, count = set_result_text(orig_payload, new_str)
+            render_change = lambda data: set_result_text(data, new_str, RENDER_INFO_PATH)[0]
+
+        if count == 0:
+            if not old_str:
                 conn.close()
                 raise ValueError(
                     f"Could not automatically detect original observation in step {result_step} payload. Please provide --replace-old."
                 )
-
-        if tool_name in COMMAND_TOOLS:
-            if simulate_error is not None:
-                has_f148 = False
-                try:
-                    has_f148 = any(fn == 148 for fn, wt, val in parse_fields(orig_payload))
-                except Exception:
-                    pass
-                new_payload, proto_mod = update_command_result_payload(
-                    orig_payload,
-                    exit_code=err_code,
-                    error_output=err_text if err_text is not None else "",
-                    strip_background=bool(bg_task_id) or has_f148
-                )
-                if proto_mod:
-                    count += 1
-            elif old_str and new_str:
-                new_payload, proto_mod = update_command_result_payload(
-                    orig_payload,
-                    old_output=old_str,
-                    new_output=new_str
-                )
-                if proto_mod:
-                    count += 1
-
-        if count == 0:
-            old_bytes = old_str.encode("utf-8")
-            new_bytes = new_str.encode("utf-8")
-            new_payload, count = replace_in_bytes(orig_payload, old_bytes, new_bytes)
-            if count == 0 and old_str:
-                old_stripped = old_str.strip()
-                if old_stripped.encode("utf-8") in orig_payload:
-                    new_payload, count = replace_in_bytes(orig_payload, old_stripped.encode("utf-8"), (new_str or "").strip().encode("utf-8"))
-            # Falling back to the whole result is only right when the user named no text to search for
-            if count == 0 and not replace_old:
-                f140 = find_field_140_2(orig_payload)
-                if f140 and f140.encode("utf-8") in orig_payload:
-                    new_payload, count = replace_in_bytes(orig_payload, f140.encode("utf-8"), (new_str or "").strip().encode("utf-8"))
-                elif f140 and f140.strip().encode("utf-8") in orig_payload:
-                    new_payload, count = replace_in_bytes(orig_payload, f140.strip().encode("utf-8"), (new_str or "").strip().encode("utf-8"))
+            pair = (old_str.encode("utf-8"), new_str.encode("utf-8"))
+            new_payload, count = replace_in_result(orig_payload, *pair)
+            if count == 0:
+                pair = (old_str.strip().encode("utf-8"), new_str.strip().encode("utf-8"))
+                new_payload, count = replace_in_result(orig_payload, *pair)
+            arguments = tool_argument_values(orig_payload)
+            render_change = lambda data: replace_in_result(data, pair[0], pair[1], RENDER_INFO_PATH, arguments)[0]
 
         if tool_name in INQUIRY_TOOLS and inquiry_questions and inquiry_resolved_selections:
             new_payload, entry_count = update_inquiry_entries(new_payload, inquiry_questions, inquiry_resolved_selections)
@@ -2809,10 +3080,10 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
     inspect_steps_dir = os.path.join(src_dir, "brain", src_cid, ".system_generated", "steps")
 
     if dry_run:
-        tf_del = modify_or_truncate_jsonl(inspect_tf_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        tc_del = modify_or_truncate_jsonl(inspect_tc_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        cf_del_lines, cf_del_files = modify_or_truncate_chunks(inspect_chunks_full, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
-        cc_del_lines, cc_del_files = modify_or_truncate_chunks(inspect_chunks_comp, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True)
+        tf_del = modify_or_truncate_jsonl(inspect_tf_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
+        tc_del = modify_or_truncate_jsonl(inspect_tc_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
+        cf_del_lines, cf_del_files = modify_or_truncate_chunks(inspect_chunks_full, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
+        cc_del_lines, cc_del_files = modify_or_truncate_chunks(inspect_chunks_comp, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=True, whole_result=whole_result)
         hist_del = count_or_filter_history(inspect_history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=True)
         st_del, st_mod, st_rem_files = sync_or_prune_step_dirs(
             inspect_steps_dir,
@@ -2822,7 +3093,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             new_str=new_str,
             new_web_content=web_content_text,
             delete_web_content=(simulate_error is not None),
-            dry_run=True
+            dry_run=True,
+            whole_result=whole_result
         )
 
         if source_conv_id:
@@ -2849,6 +3121,7 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             print(f"[DRY-RUN] Would remove background task messages for: {bg_task_id}")
         print(f"[DRY-RUN] Steps remaining: {remaining_steps} (steps 0 to {last_result_step})")
         print(f"[DRY-RUN] Steps to be deleted from DB: {steps_to_delete}")
+        remove_future_subagents(src_dir, src_cid, last_result_step, dry_run=True)
         print(f"[DRY-RUN] gen_metadata / executor_metadata turns remaining: {remaining_model_turns}")
         if parent_refs_to_delete:
             print(f"[DRY-RUN] parent_references entries to be deleted: {parent_refs_to_delete}")
@@ -2873,6 +3146,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
 
     # 1. Update conversations/<id>.db
     cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, result_step))
+    if render_change:
+        update_render_info(cur, result_step, render_change)
     cur.execute("DELETE FROM steps WHERE idx > ?", (last_result_step,))
     cur.execute("DELETE FROM gen_metadata WHERE idx >= ?", (remaining_model_turns,))
     cur.execute("DELETE FROM executor_metadata WHERE idx >= ?", (remaining_model_turns,))
@@ -2900,12 +3175,12 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         s_conn.close()
 
     # 3. Modify and truncate transcripts
-    tf_removed = modify_or_truncate_jsonl(transcript_full_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
-    tc_removed = modify_or_truncate_jsonl(transcript_compact_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    tf_removed = modify_or_truncate_jsonl(transcript_full_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
+    tc_removed = modify_or_truncate_jsonl(transcript_compact_path, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
 
     # 4. Modify and truncate chunk files
-    cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
-    cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+    cf_rem, cf_del = modify_or_truncate_chunks(chunks_full_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
+    cc_rem, cc_del = modify_or_truncate_chunks(chunks_compact_dir, last_result_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False, whole_result=whole_result)
 
     # 5. Filter history.jsonl
     hist_removed = count_or_filter_history(history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=False)
@@ -2920,16 +3195,9 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
             pass
 
     # 7. Remove system messages generated at or after cutoff
-    messages_removed = 0
-    if os.path.isdir(messages_dir) and cutoff_ms is not None:
-        for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-            try:
-                if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                    os.remove(m_path)
-                    messages_removed += 1
-            except OSError:
-                pass
-        prune_orphan_read_json(messages_dir)
+    messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
+
+    remove_future_subagents(base_dir, conv_id, last_result_step)
 
     # 8. Synchronize and prune step output artifacts
     st_purged, st_updated, st_removed_files = sync_or_prune_step_dirs(
@@ -2940,7 +3208,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         new_str=new_str,
         new_web_content=web_content_text,
         delete_web_content=(simulate_error is not None and tool_name not in COMMAND_TOOLS),
-        dry_run=False
+        dry_run=False,
+        whole_result=whole_result
     )
 
     # 9. Prune downstream background task logs and clean up converted background task
@@ -2980,6 +3249,8 @@ def execute_tool_intervene(base_dir: str, conv_id: str, target_step: int,
         print(f"  - Cleaned background task artifacts for '{bg_task_id}' (converted to synchronous result).")
     if web_content_text is not None:
         print(f"  - Updated web content artifact: steps/{result_step}/content.md ({len(web_content_text)} bytes).")
+        if not new_str:
+            print("  - Note: the saved page is not in the stored result, so the result was left as it is. Use --replace-text to change it.")
     print(f"  - Deleted {steps_to_delete} downstream step(s) from 'steps' table.")
     print(f"  - Remaining steps count: {remaining_steps} (steps 0 to {last_result_step}).")
     print(f"  - Truncated {tf_removed} line(s) from transcript_full.jsonl and {tc_removed} line(s) from transcript.jsonl.")
@@ -3132,8 +3403,7 @@ def truncate_child_subagent(base_dir: str, child_uuid: str, child_step_index: in
 
     child_db_path = os.path.join(base_dir, "conversations", f"{child_uuid}.db")
     if os.path.exists(child_db_path):
-        try:
-            conn = sqlite3.connect(child_db_path)
+        with open_database(child_db_path) as conn:
             cur = conn.cursor()
             cnt_row = cur.execute("SELECT count(*) FROM steps WHERE idx > ?", (child_step_index,)).fetchone()
             result["db_steps_deleted"] = cnt_row[0] if cnt_row else 0
@@ -3150,14 +3420,13 @@ def truncate_child_subagent(base_dir: str, child_uuid: str, child_step_index: in
                 cur.execute("DELETE FROM executor_metadata WHERE idx >= ?", (child_model_turns,))
 
                 if replace_old and replace_new:
+                    old_bytes = replace_old.encode("utf-8")
+                    new_bytes = replace_new.encode("utf-8")
                     for r_idx, r_payload in cur.execute("SELECT idx, step_payload FROM steps WHERE idx <= ?", (child_step_index,)).fetchall():
-                        if r_payload and replace_old.encode("utf-8") in r_payload:
-                            new_payload = r_payload.replace(replace_old.encode("utf-8"), replace_new.encode("utf-8"))
-                            cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, r_idx))
-                conn.commit()
-            conn.close()
-        except Exception:
-            pass
+                        if r_payload and old_bytes in r_payload:
+                            new_payload, count = replace_in_result(r_payload, old_bytes, new_bytes)
+                            if count:
+                                cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, r_idx))
 
     child_brain_dir = os.path.join(base_dir, "brain", child_uuid)
     child_logs_dir = os.path.join(child_brain_dir, ".system_generated", "logs")
@@ -3218,40 +3487,33 @@ def truncate_child_subagent(base_dir: str, child_uuid: str, child_step_index: in
                 pass
 
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
-    if os.path.exists(summary_db_path):
-        try:
-            s_conn = sqlite3.connect(summary_db_path)
-            s_cur = s_conn.cursor()
-            if not dry_run:
-                if subagent_exit in ("crash", "complete"):
-                    c_status = "CASCADE_RUN_STATUS_KILLED" if subagent_exit == "crash" else "CASCADE_RUN_STATUS_IDLE"
-                    update_sql = """
-                        UPDATE conversation_summaries
-                        SET step_count = ?,
-                            status = ?,
-                            killed = 1,
-                            not_fully_idle = 0,
-                            raw_summary = NULL
-                    """
-                    params = [child_step_index + 1, c_status]
-                else:
-                    update_sql = """
-                        UPDATE conversation_summaries
-                        SET step_count = ?,
-                            raw_summary = NULL
-                    """
-                    params = [child_step_index + 1]
-                if cutoff_iso:
-                    update_sql += ", last_modified_time = ?"
-                    params.append(cutoff_iso)
-                update_sql += " WHERE conversation_id = ?"
-                params.append(child_uuid)
-                s_cur.execute(update_sql, tuple(params))
-                s_conn.commit()
-                result["summary_updated"] = True
-            s_conn.close()
-        except Exception:
-            pass
+    if os.path.exists(summary_db_path) and not dry_run:
+        with open_database(summary_db_path) as s_conn:
+            if subagent_exit in ("crash", "complete"):
+                c_status = "CASCADE_RUN_STATUS_KILLED" if subagent_exit == "crash" else "CASCADE_RUN_STATUS_IDLE"
+                update_sql = """
+                    UPDATE conversation_summaries
+                    SET step_count = ?,
+                        status = ?,
+                        killed = 1,
+                        not_fully_idle = 0,
+                        raw_summary = NULL
+                """
+                params = [child_step_index + 1, c_status]
+            else:
+                update_sql = """
+                    UPDATE conversation_summaries
+                    SET step_count = ?,
+                        raw_summary = NULL
+                """
+                params = [child_step_index + 1]
+            if cutoff_iso:
+                update_sql += ", last_modified_time = ?"
+                params.append(cutoff_iso)
+            update_sql += " WHERE conversation_id = ?"
+            params.append(child_uuid)
+            s_conn.execute(update_sql, tuple(params))
+        result["summary_updated"] = True
 
     return result
 
@@ -3272,6 +3534,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     marks subagent status in .system_generated/subagents/<child_uuid>.json and conversation_summaries.db,
     truncates downstream steps, and arms conversation state for resumption.
     """
+    check_replacement_pair(target_step, replace_old, replace_new)
     src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
@@ -3383,15 +3646,13 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
         child_db = os.path.join(base_dir, "conversations", f"{sender_uuid}.db")
         if not os.path.exists(child_db) and source_base_dir:
             child_db = os.path.join(source_base_dir, "conversations", f"{sender_uuid}.db")
+        # The parent's step number means nothing to the child, so cutting there would remove the wrong steps
         if os.path.exists(child_db):
-            try:
-                cconn = sqlite3.connect(child_db)
-                max_s = cconn.execute("SELECT MAX(idx) FROM steps WHERE idx <= ?", (target_step,)).fetchone()
-                if max_s and max_s[0] is not None:
-                    child_step_index = max_s[0]
-                cconn.close()
-            except Exception:
-                pass
+            conn.close()
+            raise ValueError(
+                f"Could not tell which step of subagent {sender_uuid} sent the report at step {target_step}. "
+                "Use --child-step to name it."
+            )
 
     # Extract original subagent report content
     original_report = proto_content
@@ -3422,7 +3683,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     elif replace_text:
         base_report = replace_text
     elif replace_old and replace_new:
-        if replace_old not in original_report and replace_old.encode("utf-8") not in orig_payload:
+        if replace_old not in original_report:
             conn.close()
             raise ValueError(f"Target string '{clean_preview(replace_old, 50)}' not found in Step {target_step} subagent report.")
         base_report = original_report.replace(replace_old, replace_new)
@@ -3444,12 +3705,12 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
     # Calculate modified protobuf payload for Step target_step
     old_bytes = original_report.encode("utf-8")
     new_bytes = final_report.encode("utf-8")
-    new_payload, count = replace_in_bytes(orig_payload, old_bytes, new_bytes)
-    if count == 0 and replace_old and replace_new and not trailer:
-        new_payload, count = replace_in_bytes(orig_payload, replace_old.encode("utf-8"), replace_new.encode("utf-8"))
-    if replace_old and replace_new and replace_old != replace_new and replace_old.encode("utf-8") in new_payload:
-        new_payload, sub_count = replace_in_bytes(new_payload, replace_old.encode("utf-8"), replace_new.encode("utf-8"))
-        count += sub_count
+    # A copy of the report can be stored inside JSON arguments, where only the text it was asked to change may match
+    alternatives = [(json.dumps(original_report, ensure_ascii=False)[1:-1].encode("utf-8"),
+                     json.dumps(final_report, ensure_ascii=False)[1:-1].encode("utf-8"))]
+    if replace_old and replace_new:
+        alternatives.append((replace_old.encode("utf-8"), replace_new.encode("utf-8")))
+    new_payload, count = replace_in_result(orig_payload, old_bytes, new_bytes, alternatives=alternatives)
 
     # Synthesize Step target_step + 1 system message if crash
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3544,6 +3805,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
             print(f"[DRY-RUN] Child conversation_summaries status will be set to: 'CASCADE_RUN_STATUS_IDLE', killed: 1")
         print(f"[DRY-RUN] Steps remaining: {total_remaining_steps} (steps 0 to {effective_cutoff_step})")
         print(f"[DRY-RUN] Steps to be deleted from DB: {steps_to_delete}")
+        remove_future_subagents(src_dir, src_cid, target_step, dry_run=True)
         print(f"[DRY-RUN] gen_metadata / executor_metadata turns remaining: {remaining_model_turns}")
         if parent_refs_to_delete:
             print(f"[DRY-RUN] parent_references entries to be deleted: {parent_refs_to_delete}")
@@ -3572,6 +3834,21 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
             print(f"[DRY-RUN] Child step artifact dirs to purge: {c_res['step_dirs_purged']}")
         conn.close()
         return
+
+    # Update the child first, so that a failure there leaves the parent as it was
+    child_clean_res = {}
+    if sender_uuid and child_step_index is not None:
+        child_clean_res = truncate_child_subagent(
+            base_dir=base_dir,
+            child_uuid=sender_uuid,
+            child_step_index=child_step_index,
+            subagent_exit=subagent_exit,
+            cutoff_ms=cutoff_ms,
+            cutoff_iso=now_iso,
+            replace_old=replace_old,
+            replace_new=replace_new,
+            dry_run=False
+        )
 
     # 1. Update conversations/<id>.db
     cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, target_step))
@@ -3661,11 +3938,7 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
 
     if subagent_exit == "crash":
         for cdir in [chunks_full_dir, chunks_compact_dir]:
-            if os.path.isdir(cdir):
-                chunk_files = sorted(glob.glob(os.path.join(cdir, "*.jsonl")))
-                if chunk_files:
-                    with open(chunk_files[-1], "a", encoding="utf-8") as f:
-                        f.write(sys_full_line)
+            rewrite_chunks(cdir, lambda lines: ([*lines, sys_full_line], 0))
 
     # 6. Filter history.jsonl
     hist_removed = count_or_filter_history(history_path, conv_id, cutoff_ms, rewound_prompts, dry_run=False)
@@ -3754,27 +4027,14 @@ def execute_subagent_intervene(base_dir: str, conv_id: str, target_step: int,
         except OSError:
             pass
 
-    # 10. Prune downstream step output artifact dirs
-    st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, dry_run=False)
+    remove_future_subagents(base_dir, conv_id, target_step)
+
+    # 10. Prune downstream step output artifact dirs. Passing modify_step keeps the selected step's own folder.
+    st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, target_step, modify_step=target_step, dry_run=False)
 
     # Prune downstream background task logs
     tasks_dir = os.path.join(base_dir, "brain", conv_id, ".system_generated", "tasks")
     tasks_purged = prune_tasks_dir(tasks_dir, target_step + 1, dry_run=False)
-
-    # 11. Synchronize and truncate child subagent artifacts
-    child_clean_res = {}
-    if sender_uuid and child_step_index is not None:
-        child_clean_res = truncate_child_subagent(
-            base_dir=base_dir,
-            child_uuid=sender_uuid,
-            child_step_index=child_step_index,
-            subagent_exit=subagent_exit,
-            cutoff_ms=cutoff_ms,
-            cutoff_iso=now_iso,
-            replace_old=replace_old,
-            replace_new=replace_new,
-            dry_run=False
-        )
 
     print(f"Successfully executed Subagent Intervene Mode on conversation {conv_id} at Step {target_step}:")
     print(f"  - Subagent UUID: {sender_uuid or 'unknown'} (exit mode: {subagent_exit})")
@@ -3925,6 +4185,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
     or an asynchronous background task notification (SYSTEM_MESSAGE, step_type = 101).
     Synchronizes SQLite steps, transcripts, chunk logs, message files, and tasks/task-*.log.
     """
+    check_replacement_pair(target_step + 1 if category == "tool_call_task" else target_step, replace_old, replace_new)
     src_cid = source_conv_id or conv_id
     conv_db_path = os.path.join(base_dir, "conversations", f"{conv_id}.db")
     summary_db_path = os.path.join(base_dir, "conversation_summaries.db")
@@ -4079,7 +4340,17 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                             extracted = m.group(1)
                 old_str = extracted or ""
 
-        new_payload, count = replace_in_bytes(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8")) if old_str else (orig_payload, 0)
+        count = 0
+        new_payload = orig_payload
+        # The same change, for the result's display copy in steps.render_info
+        render_change = None
+        if changes_text and not replace_old:
+            new_payload, count = set_result_text(orig_payload, new_str)
+            render_change = lambda data: set_result_text(data, new_str, RENDER_INFO_PATH)[0]
+        if count == 0 and old_str:
+            new_payload, count = replace_in_result(orig_payload, old_str.encode("utf-8"), new_str.encode("utf-8"))
+            arguments = tool_argument_values(orig_payload)
+            render_change = lambda data: replace_in_result(data, old_str.encode("utf-8"), new_str.encode("utf-8"), RENDER_INFO_PATH, arguments)[0]
         # With no replacement requested, such as a log option alone, there is nothing to apply
         if count == 0 and (replace_old or new_str):
             conn.close()
@@ -4155,12 +4426,15 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             if task_id and output_text is not None:
                 print(f"[DRY-RUN] Would update task log: tasks/{task_id}.log ({len(output_text)} bytes)")
             print(f"[DRY-RUN] Would delete {steps_to_delete} downstream step(s) from 'steps' table.")
+            remove_future_subagents(source_base_dir or base_dir, src_cid, cutoff_step, dry_run=True)
             if discrepancy_lines:
                 print_standout_box(discrepancy_lines, border_char="!", file=sys.stderr)
             return task_id
 
         if count > 0:
             cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (new_payload, result_step))
+            if render_change:
+                update_render_info(cur, result_step, render_change)
         cur.execute("DELETE FROM steps WHERE idx > ?", (cutoff_step,))
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
         trim_turn_metadata(cur, tables)
@@ -4211,18 +4485,11 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             except OSError:
                 pass
 
-        messages_removed = 0
-        if os.path.isdir(messages_dir) and cutoff_ms is not None:
-            for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-                try:
-                    if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                        os.remove(m_path)
-                        messages_removed += 1
-                except OSError:
-                    pass
-            prune_orphan_read_json(messages_dir)
+        messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms)
+        remove_future_subagents(base_dir, conv_id, cutoff_step)
 
-        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=result_step, old_str=old_str, new_str=new_str, dry_run=False)
+        st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=result_step, old_str=old_str, new_str=new_str,
+                                                  dry_run=False, whole_result=(changes_text and not replace_old))
         tasks_purged = prune_tasks_dir(tasks_dir, cutoff_step + 1, dry_run=False)
 
         print(f"Successfully executed Intervene Mode on conversation {conv_id} at Step {target_step} ({tool_name}):")
@@ -4379,14 +4646,14 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
 
             if ts_low in ("cancelled", "canceled"):
                 new_content = f'Task id "{tid_label}" has been cancelled by the user.'
-            elif ts_low in ("failed", "error") or exit_code != 0:
-                new_content = f'Task id "{tid_label}" finished with result:\n\nThe command exited with code {exit_code}.'
-                if output_text is not None and output_text.strip():
-                    new_content += f"\nError:\n{output_text}"
             elif ts_low == "running":
                 new_content = f'Task id "{tid_label}" is currently running.'
                 if output_text is not None and output_text.strip():
                     new_content += f"\nOutput:\n{output_text}"
+            elif ts_low in ("failed", "error") or exit_code != 0:
+                new_content = f'Task id "{tid_label}" finished with result:\n\nThe command exited with code {exit_code}.'
+                if output_text is not None and output_text.strip():
+                    new_content += f"\nError:\n{output_text}"
             else:
                 new_content = f'Task id "{tid_label}" finished with result:\n\nThe command exited with code {exit_code}.'
                 if output_text is not None and output_text.strip():
@@ -4406,15 +4673,25 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                     f"</SYSTEM_MESSAGE>"
                 )
 
-        new_payload = build_system_message_payload(
-            conv_id,
-            target_step,
-            msg_id,
-            new_content,
-            step_iso_ts,
-            sender=sender,
-            priority=priority
-        )
+        # Only the text changes, so the step keeps its timestamps, IDs and the fields this tool does not know.
+        # A message with no text in the database has nothing to edit, and has to be written from scratch.
+        new_payload = orig_payload
+        count = 0
+        if changes_text and proto_content:
+            escaped_pair = (json.dumps(proto_content, ensure_ascii=False)[1:-1].encode("utf-8"),
+                            json.dumps(new_content, ensure_ascii=False)[1:-1].encode("utf-8"))
+            new_payload, count = replace_in_result(orig_payload, proto_content.encode("utf-8"), new_content.encode("utf-8"),
+                                                   alternatives=[escaped_pair])
+        if changes_text and count == 0:
+            new_payload = build_system_message_payload(
+                conv_id,
+                target_step,
+                msg_id,
+                new_content,
+                step_iso_ts,
+                sender=sender,
+                priority=priority
+            )
 
         cutoff_step = target_step
 
@@ -4485,6 +4762,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             if task_id and output_text is not None:
                 print(f"[DRY-RUN] Would update task log: tasks/{task_id}.log ({len(output_text)} bytes)")
             print(f"[DRY-RUN] Would delete {steps_to_delete} downstream step(s) from 'steps' table.")
+            remove_future_subagents(source_base_dir or base_dir, src_cid, cutoff_step, dry_run=True)
             if discrepancy_lines:
                 print_standout_box(discrepancy_lines, border_char="!", file=sys.stderr)
             return task_id
@@ -4552,6 +4830,7 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
                         "content": new_content
                     }, f, indent=2)
                 msg_updated = True
+                matched_msg_file = msg_path
             except Exception:
                 pass
 
@@ -4571,18 +4850,8 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
             except OSError:
                 pass
 
-        messages_removed = 0
-        if os.path.isdir(messages_dir) and cutoff_ms is not None:
-            for m_path in glob.glob(os.path.join(messages_dir, "*.json")):
-                if matched_msg_file and os.path.abspath(m_path) == os.path.abspath(matched_msg_file):
-                    continue
-                try:
-                    if os.path.getmtime(m_path) * 1000 >= (cutoff_ms - 1000):
-                        os.remove(m_path)
-                        messages_removed += 1
-                except OSError:
-                    pass
-            prune_orphan_read_json(messages_dir)
+        messages_removed = purge_messages_after_cut(messages_dir, cutoff_ms, keep_file=matched_msg_file)
+        remove_future_subagents(base_dir, conv_id, cutoff_step)
 
         # Passing modify_step keeps the selected step's own folder, which is otherwise treated as discarded
         st_purged, _, _ = sync_or_prune_step_dirs(steps_dir, cutoff_step, modify_step=cutoff_step, dry_run=False)
@@ -4620,30 +4889,36 @@ def execute_task_intervene(base_dir: str, conv_id: str, target_step: int,
         return task_id
 
 
-def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = False) -> int:
+def remove_step_and_shift_lines(lines, remove_step: int) -> tuple[list[str], int]:
     """Removes the line for remove_step and shifts step_index by -1 for steps > remove_step."""
-    if not os.path.exists(path):
-        return 0
     kept = []
     removed = 0
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+            idx = data.get("step_index")
+            if idx is not None and idx == remove_step:
+                removed += 1
                 continue
-            try:
-                data = json.loads(line)
-                idx = data.get("step_index")
-                if idx is not None and idx == remove_step:
-                    removed += 1
-                    continue
-                if idx is not None and idx > remove_step:
-                    data["step_index"] = idx - 1
-                    line = json.dumps(data, ensure_ascii=False) + "\n"
-                kept.append(line if line.endswith("\n") else line + "\n")
-            except Exception:
-                kept.append(line if line.endswith("\n") else line + "\n")
+            if idx is not None and idx > remove_step:
+                data["step_index"] = idx - 1
+                line = json.dumps(data, ensure_ascii=False) + "\n"
+            kept.append(line if line.endswith("\n") else line + "\n")
+        except Exception:
+            kept.append(line if line.endswith("\n") else line + "\n")
+    return kept, removed
 
-    if not dry_run and removed > 0:
+
+def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = False) -> int:
+    """Applies remove_step_and_shift_lines to a transcript file. Returns number of removed lines."""
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        kept, removed = remove_step_and_shift_lines(f, remove_step)
+    # Written even if the line was not there: a transcript can leave a step out, and later steps still move
+    if not dry_run:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(kept)
     return removed
@@ -4651,23 +4926,126 @@ def remove_step_and_shift_jsonl(path: str, remove_step: int, dry_run: bool = Fal
 
 def remove_step_and_shift_chunks(chunks_dir: str, remove_step: int, dry_run: bool = False) -> tuple[int, int]:
     """Applies step removal and index shift across chunk files."""
-    if not os.path.isdir(chunks_dir):
-        return 0, 0
-    total_removed = 0
-    deleted_files = 0
-    for chunk_file in glob.glob(os.path.join(chunks_dir, "*.jsonl")):
-        rem = remove_step_and_shift_jsonl(chunk_file, remove_step, dry_run=dry_run)
-        total_removed += rem
-        if not dry_run:
-            if os.path.exists(chunk_file) and os.path.getsize(chunk_file) == 0:
-                os.remove(chunk_file)
-                deleted_files += 1
-        else:
-            with open(chunk_file, "r", encoding="utf-8") as cf:
-                lines_in_chunk = sum(1 for l in cf if l.strip())
-            if lines_in_chunk > 0 and rem >= lines_in_chunk:
-                deleted_files += 1
-    return total_removed, deleted_files
+    return rewrite_chunks(chunks_dir, lambda lines: remove_step_and_shift_lines(lines, remove_step), dry_run)
+
+
+def remove_step_dir_and_shift(steps_dir: str, remove_step: int) -> None:
+    """Removes a step's folder and renumbers the later ones, so that each output stays with its step."""
+    if not os.path.isdir(steps_dir):
+        return
+    numbers = sorted(int(entry) for entry in os.listdir(steps_dir)
+                     if entry.isdigit() and os.path.isdir(os.path.join(steps_dir, entry)))
+    for number in numbers:
+        if number == remove_step:
+            shutil.rmtree(os.path.join(steps_dir, str(number)))
+        elif number > remove_step:
+            os.rename(os.path.join(steps_dir, str(number)), os.path.join(steps_dir, str(number - 1)))
+
+
+# Where a real step stores its own index: in step_payload, its metadata and a wrapped copy of it, and in the metadata column
+PAYLOAD_INDEX_FIELDS = frozenset({(5, 20, 2), (140, 2, 6, 2, 5, 20, 2)})
+METADATA_INDEX_FIELDS = frozenset({(20, 2)})
+
+
+def set_stored_step_index(data: bytes, old_index: int, new_index: int, index_fields: frozenset,
+                          path: tuple[int, ...] = ()) -> bytes:
+    """Changes the index a step stores about itself. Data that is not a real step's layout is returned as it is."""
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        return data
+    new_fields = []
+    for fn, wt, val in fields:
+        here = path + (fn,)
+        if wt == 0 and here in index_fields and val == old_index:
+            val = new_index
+        elif wt == 2 and any(field[:len(here)] == here for field in index_fields):
+            val = set_stored_step_index(val, old_index, new_index, index_fields, here)
+        new_fields.append((fn, wt, val))
+    return serialize_fields(new_fields)
+
+
+def shift_stored_step_numbers(cur: sqlite3.Cursor, conv_id: str, removed_step: int) -> None:
+    """Updates what later steps store about their own position, after the rows moved down by one."""
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(steps)").fetchall()}
+    has_metadata = "metadata" in columns
+    selected = "idx, step_payload, metadata" if has_metadata else "idx, step_payload, NULL"
+    for new_index, payload, metadata in cur.execute(f"SELECT {selected} FROM steps WHERE idx >= ?", (removed_step,)).fetchall():
+        old_index = new_index + 1
+        if payload:
+            payload = set_stored_step_index(payload, old_index, new_index, PAYLOAD_INDEX_FIELDS)
+            old_path = f"{conv_id}/.system_generated/steps/{old_index}/".encode("utf-8")
+            payload, _ = replace_in_bytes(payload, old_path, f"{conv_id}/.system_generated/steps/{new_index}/".encode("utf-8"))
+            cur.execute("UPDATE steps SET step_payload = ? WHERE idx = ?", (payload, new_index))
+        if metadata:
+            metadata = set_stored_step_index(metadata, old_index, new_index, METADATA_INDEX_FIELDS)
+            cur.execute("UPDATE steps SET metadata = ? WHERE idx = ?", (metadata, new_index))
+
+
+# How a typed prompt is stored and sent: wrapped in tags, with the local time added. The same rule as interceptor.py:
+# a prompt is a kickstart only if what was typed is the token and nothing else, so a real prompt quoting it stays.
+USER_REQUEST = re.compile(r"\s*<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>\s*(?:<ADDITIONAL_METADATA>.*</ADDITIONAL_METADATA>\s*)?", re.DOTALL)
+
+
+def typed_prompt(text: str) -> str:
+    """Returns what the user typed, without the request wrapper if there is one."""
+    match = USER_REQUEST.fullmatch(text)
+    return match.group(1) if match else text.strip()
+
+
+def stored_texts(data: bytes) -> list[str]:
+    """Every value a stored prompt holds, at any depth, read as text."""
+    texts = [data.decode("utf-8", errors="replace")]
+    try:
+        fields = parse_fields(data)
+    except ValueError:
+        return texts
+    for _, wt, val in fields:
+        if wt == 2 and val:
+            texts.extend(stored_texts(val))
+    return texts
+
+
+def is_kickstart_prompt(shown: str | None, payload: bytes | None, token: str) -> bool:
+    """Decides from the transcript line if there is one, or else from the prompt stored in the database."""
+    if shown is not None:
+        return typed_prompt(shown) == token
+    return any(typed_prompt(text) == token for text in stored_texts(payload or b""))
+
+
+def find_kickstart_notices(cur: sqlite3.Cursor, transcript_path: str, kickstart_steps: list[int]) -> tuple[list[int], list[str]]:
+    """
+    Returns the system notices straight after each kickstart prompt, and their message IDs. A prompted turn on a
+    resumed session adds one, telling the model that its subagents and background tasks were stopped. It belongs to
+    the kickstart, and the next request would still send it. Messages from tasks or subagents are real, and stay.
+    """
+    shown = {}
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                shown[record.get("step_index")] = str(record.get("content", ""))
+    notices, message_ids = [], []
+    for k_step in kickstart_steps:
+        step = k_step + 1
+        while step not in kickstart_steps:
+            row = cur.execute("SELECT step_type, step_payload FROM steps WHERE idx = ?", (step,)).fetchone()
+            if not row or row[0] != 101:
+                break
+            msg_id, sender, _ = extract_subagent_msg_info(row[1] or b"")
+            if sender is None:
+                match = re.search(r"\bsender=(\S+)", shown.get(step, ""))
+                sender = match.group(1) if match else None
+            if sender != "system":
+                break
+            notices.append(step)
+            if msg_id:
+                message_ids.append(msg_id)
+            step += 1
+    return notices, message_ids
 
 
 def execute_kickstart_cleanup(
@@ -4716,33 +5094,33 @@ def execute_kickstart_cleanup(
         (STEP_TYPE_USER_INPUT,)
     ).fetchall()
 
-    kickstart_steps = []
-    for idx, payload in candidate_rows:
-        if payload and token_bytes in payload:
-            kickstart_steps.append(idx)
-
-    # Fallback to transcripts if not found in SQLite payload directly
-    if not kickstart_steps and os.path.exists(transcript_full_path):
+    shown = {}
+    if os.path.exists(transcript_full_path):
         with open(transcript_full_path, "r", encoding="utf-8") as f:
             for line in f:
-                if token in line:
-                    try:
-                        d = json.loads(line)
-                        s_idx = d.get("step_index")
-                        if s_idx is not None and s_idx not in kickstart_steps:
-                            kickstart_steps.append(s_idx)
-                    except Exception:
-                        pass
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and isinstance(record.get("content"), str):
+                    shown[record.get("step_index")] = record["content"]
+
+    kickstart_steps = [idx for idx, payload in candidate_rows if is_kickstart_prompt(shown.get(idx), payload, token)]
 
     if not kickstart_steps:
         conn.close()
         print(f"No kickstart step containing token '{token}' was found in conversation {conv_id}.")
         return
 
+    notice_steps, notice_ids = find_kickstart_notices(cur, transcript_full_path, kickstart_steps)
+    removed_steps = sorted(set(kickstart_steps) | set(notice_steps), reverse=True)
+
     tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
 
     if dry_run:
         print(f"[DRY-RUN] Conversation ID: {conv_id}")
+        for n_step in notice_steps:
+            print(f"[DRY-RUN] Would also delete Step {n_step}, the system notice added with the kickstart.")
         for k_step in sorted(kickstart_steps, reverse=True):
             print(f"[DRY-RUN] Found kickstart prompt at Step {k_step} containing token '{token}'.")
             print(f"[DRY-RUN] Would delete Step {k_step} from 'steps' table.")
@@ -4769,10 +5147,11 @@ def execute_kickstart_cleanup(
         cur = conn.cursor()
         tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
 
-    for k_step in sorted(kickstart_steps, reverse=True):
+    for k_step in removed_steps:
         # 1. Update SQLite
         cur.execute("DELETE FROM steps WHERE idx = ?", (k_step,))
         cur.execute("UPDATE steps SET idx = idx - 1 WHERE idx > ?", (k_step,))
+        shift_stored_step_numbers(cur, conv_id, k_step)
         if "parent_references" in tables:
             cur.execute("DELETE FROM parent_references WHERE idx = ?", (k_step,))
             cur.execute("UPDATE parent_references SET idx = idx - 1 WHERE idx > ?", (k_step,))
@@ -4788,6 +5167,9 @@ def execute_kickstart_cleanup(
         remove_step_and_shift_chunks(target_chunks_full, k_step, dry_run=False)
         remove_step_and_shift_chunks(target_chunks_comp, k_step, dry_run=False)
 
+        # 4. Update step folders
+        remove_step_dir_and_shift(os.path.join(base_dir, "brain", conv_id, ".system_generated", "steps"), k_step)
+
     conn.commit()
 
     # Calculate remaining step counts and last user input
@@ -4797,7 +5179,7 @@ def execute_kickstart_cleanup(
         last_user_input = -1
     conn.close()
 
-    # 4. Update conversation_summaries.db
+    # 5. Update conversation_summaries.db
     if os.path.exists(target_summary_db):
         with open_database(target_summary_db) as s_conn:
             s_cur = s_conn.cursor()
@@ -4806,23 +5188,39 @@ def execute_kickstart_cleanup(
                 SET step_count = ?,
                     last_user_input_step_index = ?,
                     status = 'CASCADE_RUN_STATUS_IDLE',
-                    not_fully_idle = 0
+                    not_fully_idle = 0,
+                    raw_summary = NULL
                 WHERE conversation_id = ?
             """, (remaining_steps, last_user_input, conv_id))
             s_conn.commit()
 
-    # 5. Filter history.jsonl
+    # 6. Filter history.jsonl
     if os.path.exists(target_history_path):
         kept_hist = []
         with open(target_history_path, "r", encoding="utf-8") as f:
             for line in f:
-                if token in line:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    entry = None
+                # Only this session's kickstart: a real prompt quoting the token, and other sessions, stay
+                if (isinstance(entry, dict) and entry.get("conversationId") == conv_id
+                        and isinstance(entry.get("display"), str) and typed_prompt(entry["display"]) == token):
                     continue
                 kept_hist.append(line)
         with open(target_history_path, "w", encoding="utf-8") as f:
             f.writelines(kept_hist)
 
-    # 6. Purge caches
+    # 7. Remove the notices' message files, and their entries in read.json
+    target_messages = os.path.join(base_dir, "brain", conv_id, ".system_generated", "messages")
+    for msg_id in notice_ids:
+        message_file = os.path.join(target_messages, f"{msg_id}.json")
+        if os.path.exists(message_file):
+            os.remove(message_file)
+    if notice_ids and os.path.isdir(target_messages):
+        prune_orphan_read_json(target_messages)
+
+    # 8. Purge caches
     if os.path.exists(target_proto_cache):
         os.remove(target_proto_cache)
     if os.path.exists(target_presence_lock):
@@ -4833,6 +5231,8 @@ def execute_kickstart_cleanup(
 
     print(f"Successfully cleaned kickstart step(s) {kickstart_steps} from conversation {conv_id}:")
     print(f"  - Deleted dummy kickstart user step(s) and decremented subsequent step indices.")
+    if notice_steps:
+        print(f"  - Deleted {len(notice_steps)} system notice(s) added with the kickstart: step(s) {sorted(notice_steps)}.")
     print(f"  - Updated 'steps' table (total steps now: {remaining_steps}).")
     print(f"  - Synchronized transcript_full.jsonl, transcript.jsonl, and chunk logs.")
     print(f"  - Updated conversation_summaries.db (step_count={remaining_steps}, last_user_input={last_user_input}, status='CASCADE_RUN_STATUS_IDLE').")
@@ -4957,8 +5357,12 @@ TOOL_INTERVENTION_CATEGORIES = ("tool_call_read", "tool_call_command", "tool_cal
 TASK_INTERVENTION_CATEGORIES = ("tool_call_task", "task_notification")
 
 
-def validate_fork_request(category: str, kwargs: dict, task_output: str | list[str] | None, keep_task_log: bool) -> None:
+def validate_fork_request(category: str, target_step: int, kwargs: dict, task_output: str | list[str] | None,
+                          keep_task_log: bool) -> None:
     """Raises ValueError for a fork that could not produce a correct result, before anything is copied."""
+    if category == "subagent_report" or category in TASK_INTERVENTION_CATEGORIES:
+        shown_step = target_step + 1 if category == "tool_call_task" else target_step
+        check_replacement_pair(shown_step, kwargs.get("replace_old"), kwargs.get("replace_new"))
     if category in ("prompt", "model_response", "subagent_report"):
         return
     if category not in TOOL_INTERVENTION_CATEGORIES + TASK_INTERVENTION_CATEGORIES:
@@ -5083,6 +5487,11 @@ def clone_kept_subagents(base_dir: str, source_id: str, new_parent_id: str, last
         child_db = os.path.join(base_dir, "conversations", f"{child_id}.db")
         kept = (last_kept_step is None or child_id == required_id
                 or any(child_id.encode("utf-8") in payload for payload in kept_payloads))
+        if child_id == required_id and not os.path.exists(child_db):
+            # With no copy, the intervention that follows would change the original subagent
+            raise ValueError(
+                f"Cannot fork at this report: the database of subagent {child_id} is missing, so the fork could not have its own copy."
+            )
         if not kept or not os.path.exists(child_db):
             descriptor = os.path.join(base_dir, "brain", new_parent_id, ".system_generated", "subagents", f"{child_id}.json")
             if os.path.exists(descriptor):
@@ -5149,7 +5558,7 @@ def execute_fork(
     Returns the newly created fork conversation ID.
     """
     kwargs = dict(intervention_kwargs or {})
-    validate_fork_request(category, kwargs, task_output, keep_task_log)
+    validate_fork_request(category, target_step, kwargs, task_output, keep_task_log)
 
     fork_cid = fork_conv_id or str(uuid.uuid4())
     # A failed fork deletes its destination, so that destination must never be an existing conversation
@@ -5621,6 +6030,13 @@ def main():
         if is_step_number:
             raw_source = os.path.abspath(os.path.expanduser(args.dir))
             raw_dest = os.path.abspath(os.path.expanduser(args.out_dir)) if args.out_dir else raw_source
+
+            if getattr(args, "fork", None) is not None and args.out_dir:
+                print_standout_box(
+                    ["Error: --fork and --out-dir cannot be used together. A fork is always created beside the original."],
+                    border_char="!", file=sys.stderr
+                )
+                sys.exit(1)
 
             # Step validation: verify step exists and belongs to either prompt or an intervenable tool call
             try:

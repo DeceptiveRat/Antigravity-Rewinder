@@ -15,9 +15,22 @@ Supported Tokens:
 import json
 import logging
 import os
+import re
 import sys
 
 DEFAULT_KICKSTART_TOKEN = "__AGY_KICKSTART__"
+
+# How a system message starts. Real prompts can mention these words, so only the start of the text counts.
+SYSTEM_NOTICE_PREFIXES = ("The following is a <SYSTEM_MESSAGE>", "<SYSTEM_MESSAGE>", "[Notice]", "[Message] timestamp=")
+
+# How a typed prompt reaches the model: wrapped in tags, with the local time added after it
+USER_REQUEST = re.compile(r"\s*<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>\s*(?:<ADDITIONAL_METADATA>.*</ADDITIONAL_METADATA>\s*)?", re.DOTALL)
+
+
+def typed_text(text: str) -> str:
+    """Returns what the user typed, without the request wrapper if there is one."""
+    match = USER_REQUEST.fullmatch(text)
+    return match.group(1) if match else text.strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("interceptor")
@@ -93,74 +106,46 @@ class KickstartStripper:
             return
 
         active_tokens = self.get_active_tokens()
-        kickstart_idx = None
-        matched_token = None
-        matched_role = None
 
-        # Search backwards across all turns in contents
-        for i in range(len(contents) - 1, -1, -1):
-            turn = contents[i]
-            role = str(turn.get("role", "")).lower()
-            parts = turn.get("parts", [])
+        def part_text(part) -> str:
+            return part.get("text", "") if isinstance(part, dict) else (part if isinstance(part, str) else "")
 
-            for part in parts:
-                text = ""
-                if isinstance(part, dict):
-                    text = part.get("text", "")
-                elif isinstance(part, str):
-                    text = part
+        def is_kickstart_part(part) -> bool:
+            # Only a prompt that is the token and nothing else: a real prompt quoting the token must reach the model
+            return any(token and typed_text(part_text(part)) == token for token in active_tokens)
 
-                for token in active_tokens:
-                    if token and token in text:
-                        kickstart_idx = i
-                        matched_token = token
-                        matched_role = role
-                        break
-                if kickstart_idx is not None:
-                    break
-            if kickstart_idx is not None:
-                break
+        # A model turn quoting the token is the model's own words, not a kickstart. An earlier kickstart
+        # stays in the history that later requests carry, so every one is removed, not just the newest.
+        kickstart_indices = [
+            i for i, turn in enumerate(contents)
+            if str(turn.get("role", "")).lower() != "model" and any(is_kickstart_part(p) for p in turn.get("parts", []))
+        ]
 
-        if kickstart_idx is not None:
-            # Check if the kickstart turn has other non-kickstart parts (e.g. SYSTEM_MESSAGE)
-            target_turn = contents[kickstart_idx]
-            original_parts = target_turn.get("parts", [])
-
-            def is_kickstart_part(p):
-                t = p.get("text", "") if isinstance(p, dict) else (p if isinstance(p, str) else "")
-                return any(token and token in t for token in active_tokens)
-
-            preserved_parts = [p for p in original_parts if not is_kickstart_part(p)]
-
-            removed_indices = []
-            if preserved_parts:
-                target_turn["parts"] = preserved_parts
-            else:
-                removed_indices.append(kickstart_idx)
-
-            next_idx = kickstart_idx + 1
-            while next_idx < len(contents):
-                next_turn = contents[next_idx]
-                next_role = str(next_turn.get("role", "")).lower()
-                next_parts = next_turn.get("parts", [])
-
-                if next_role == "model":
-                    break
-                if any(isinstance(p, dict) and ("functionResponse" in p or "functionCall" in p) for p in next_parts):
-                    break
-
-                is_system_notice = False
-                for p in next_parts:
-                    t = p.get("text", "") if isinstance(p, dict) else (p if isinstance(p, str) else "")
-                    if any(marker in t for marker in ["<SYSTEM_MESSAGE>", "[Notice]", "[Message] timestamp="]):
-                        is_system_notice = True
-                        break
-
-                if is_system_notice:
-                    removed_indices.append(next_idx)
-                    next_idx += 1
+        if kickstart_indices:
+            removed_indices = set()
+            for kickstart_idx in kickstart_indices:
+                # The kickstart turn may have other parts (e.g. SYSTEM_MESSAGE), which are kept
+                target_turn = contents[kickstart_idx]
+                preserved_parts = [p for p in target_turn.get("parts", []) if not is_kickstart_part(p)]
+                if preserved_parts:
+                    target_turn["parts"] = preserved_parts
                 else:
-                    break
+                    removed_indices.add(kickstart_idx)
+
+                next_idx = kickstart_idx + 1
+                while next_idx < len(contents):
+                    next_turn = contents[next_idx]
+                    next_role = str(next_turn.get("role", "")).lower()
+                    next_parts = next_turn.get("parts", [])
+
+                    if next_role == "model":
+                        break
+                    if any(isinstance(p, dict) and ("functionResponse" in p or "functionCall" in p) for p in next_parts):
+                        break
+                    if not any(part_text(p).lstrip().startswith(SYSTEM_NOTICE_PREFIXES) for p in next_parts):
+                        break
+                    removed_indices.add(next_idx)
+                    next_idx += 1
 
             if removed_indices:
                 contents = [turn for idx, turn in enumerate(contents) if idx not in removed_indices]
@@ -177,8 +162,8 @@ class KickstartStripper:
                 )
 
             logger.info(
-                f"[*] Stripped kickstart turn! Detected token '{matched_token}' at turn index {kickstart_idx} (role: '{matched_role}'). "
-                f"Removed turn indices {removed_indices}. Outbound payload now ends at '{trailing_role}' "
+                f"[*] Stripped kickstart turn(s) at indices {kickstart_indices}. "
+                f"Removed turn indices {sorted(removed_indices)}. Outbound payload now ends at '{trailing_role}' "
                 f"(contains functionResponse: {has_tool_res}). Total turns preserved: {len(contents)}"
             )
 
