@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Improvements/Improvements - Gemini.md",
+                "file": "tests/Overview - 11.09 ver.md",
                 "mode": "preview",
                 "source": true
               },
               "icon": "lucide-file",
-              "title": "Improvements - Gemini"
+              "title": "Overview - 11.09 ver"
             }
           }
         ]
@@ -161,7 +161,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "Improvements/Improvements - Gemini.md",
+                "file": "tests/Overview - 11.09 ver.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
@@ -202,16 +202,20 @@
   },
   "active": "2766daa438576216",
   "lastOpenFiles": [
-    "__pycache__/Antigravity_Rewind.cpython-314.pyc",
-    "__pycache__",
+    "tests/__pycache__/test_tui.cpython-314-pytest-9.2.0.pyc",
+    "tests/__pycache__/test_task_interventions.cpython-314-pytest-9.2.0.pyc",
+    "tests/__pycache__/test_subagent_interventions.cpython-314-pytest-9.2.0.pyc",
+    "tests/__pycache__/test_rewind_tool.cpython-314-pytest-9.2.0.pyc",
+    "tests/__pycache__/test_rewind_interventions.cpython-314-pytest-9.2.0.pyc",
+    "tests/__pycache__/test_review_bugs.cpython-314-pytest-9.2.0.pyc",
+    "tests/__pycache__/test_review_bugs.cpython-314-pytest-9.2.0.pyc.48422",
+    "tests/__pycache__/test_model_response_and_inspection.cpython-314-pytest-9.2.0.pyc",
+    "src/rewinding/__pycache__/interceptor.cpython-314.pyc",
+    "tests/__pycache__/test_inquiry_and_interceptor.cpython-314-pytest-9.2.0.pyc",
     "src/rewinding/__pycache__/tui.cpython-314.pyc",
-    "tests/__pycache__/test_tui.cpython-314-pytest-9.1.1.pyc",
-    "tests/test_tui.py",
-    "src/rewinding/tui.py",
-    "Untitled.md",
-    "Improvements",
     "Improvements/Improvements - Gemini.md",
-    "Documents",
+    "tests/Overview - 11.09 ver.md",
+    "Untitled.md",
     "project/meetings/meeting 32 - 10.23 정기 회의/meeting 32 - 10.23 정기회의.md",
     "project/Todo/Technical Enhancement/Provenance Graph/Combined 4 schemas - Gemini Argon.md",
     "project/meetings/meeting 31 - 10.21 6th mentoring/회의록.md",
@@ -219,14 +223,11 @@
     "project/Todo/Technical Enhancement/Provenance Graph/Drawing Deterministic Edges 1 - Gemini.md",
     "project/Todo/Technical Enhancement/Provenance Graph/Drawing Deterministic Edges 2 - Gemini.md",
     "project/meetings/meeting 32 - 10.23 정기 회의/흐름도2.png",
-    "project/meetings/meeting 32 - 10.23 정기 회의",
     "project/Todo/Technical Enhancement/PL feedback.md",
-    "261022.ics",
     "project/daily report/10.22 일일 보고.md",
     "DF classes/day 29/Class 1 - (박문범 멘토님) AI를 활용한 대용량 데이터 분석 및 공격자 행위 추출(1).md",
     "project/daily report/10.21 일일 보고.md",
     "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario/setup Scenario - Gemini.md",
-    "project/meetings/meeting 31 - 10.21 6th mentoring/[AISI] 6차 멘토링 - 2026_10_21 20_16 KST - Notes by Gemini.txt",
     "project/meetings/meeting 31 - 10.21 6th mentoring/Pasted image (6).png",
     "project/Todo/Technical Enhancement/Provenance Graph/OS artifact Scenario/OS artifact scenario - Gemini.md",
     "project/Todo/Technical Enhancement/Provenance Graph/Vertices and Edges - Gemini.md",
@@ -239,7 +240,6 @@
     "project/Todo/Technical Enhancement/Rewinding/invoke tool calls.md",
     "project/Todo/Technical Enhancement/Rewinding/Measure Similarity/Measuring Similarity 1 - Gemini.md",
     "project/daily report/10.20 일일 보고.md",
-    "project/Todo/Technical Enhancement/Rewinding/LLM and Agent distinction - Gemini.md",
     "project/reports/Weekly report/Week 7/Pasted image (2).png",
     "project/reports/Weekly report/Week 7/Pasted image.png",
     "project/Todo/Technical Enhancement/Rewinding/images/kickstart_no_proxy.png",
